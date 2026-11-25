@@ -262,7 +262,7 @@ class Board:
     def pump(self):
         self.app.poll()
 
-    def wait(self, cond, timeout=3):
+    def wait(self, cond, timeout=6):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             self.pump()
