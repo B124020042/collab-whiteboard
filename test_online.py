@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""線上模式測試：WebSocket 傳輸、HTTP 狀態頁、線上房間號、伺服器重啟後復原。
+"""傳輸層與線上功能測試：WebSocket、HTTP 狀態頁、房間號、復原訊息。
 
     python3 test_online.py
 """
@@ -13,16 +13,14 @@ import unittest
 from pathlib import Path
 
 import transport
-from transport import OP_CLOSE, OP_CONT, OP_PING, OP_PONG, OP_TEXT, open_connection, ws_frame
+from transport import OP_CONT, OP_PING, OP_TEXT, open_connection, ws_frame
 
 HERE = Path(__file__).resolve().parent
 PORT = 9241
 
 
-def start_server(port, public=True, env_port=False):
+def start_server(port, env_port=False):
     args = [sys.executable, str(HERE / "server.py")] + ([] if env_port else ["--port", str(port)])
-    if public:
-        args.append("--public")
     env = dict(os.environ, PORT=str(port)) if env_port else None
     p = subprocess.Popen(args, cwd=HERE, stderr=subprocess.DEVNULL, env=env)
     for _ in range(50):
@@ -100,28 +98,16 @@ class OnlineServerTest(unittest.TestCase):
         self.assertEqual(transport.request(f"ws://127.0.0.1:{PORT}", type="room_info",
                                            room=code)["users"], 1)
         a.close()
-        time.sleep(0.2)                                         # 房間空了也保留 (線上模式)
+        time.sleep(0.2)                                         # 房間空了也保留
         self.assertTrue(transport.request(f"ws://127.0.0.1:{PORT}", type="room_info",
                                           room=code)["exists"])
-        pong = transport.request(f"ws://127.0.0.1:{PORT}", type="ping")
-        self.assertEqual((pong["rooms"], pong["public"]), ({}, True))   # 不公開房間清單
 
-    def test_ws_and_tcp_in_same_room(self):
-        """同一個 port：WebSocket 與原本的 TCP 客戶端可以在同一個房間。"""
-        w = WS("web", "mixed")
-        t = open_connection(f"127.0.0.1:{PORT}", timeout=3)
-        t.settimeout(3)
-        t.send(type="hello", name="tcp", room="mixed")
-        while t.recv()["type"] != "welcome":
-            pass
-        w.until("user_join")
-        t.send(type="draw", sid="s1", color="#ff0000", width=3, pts=[[0.1, 0.1], [0.2, 0.2]])
-        self.assertEqual(w.until("draw")["owner"], "tcp")
-        w.send(type="text", sid="t1", x=0.5, y=0.5, text="來自 WebSocket", color="#000000", size=20)
-        while (m := t.recv())["type"] != "text":
-            pass
-        self.assertEqual(m["text"], "來自 WebSocket")
-        w.close(); t.close()
+    def test_non_http_rejected(self):
+        """不是 HTTP / WebSocket 的連線會直接被關閉，伺服器不受影響。"""
+        with socket.create_connection(("127.0.0.1", PORT), timeout=3) as raw:
+            raw.sendall(b'{"type":"hello","name":"x","room":"y"}\n')
+            self.assertEqual(raw.recv(100), b"")
+        self.assertTrue(transport.request(f"ws://127.0.0.1:{PORT}", type="room_info", room="y"))
 
     def test_frames_fragmented_ping_large(self):
         w = WS("frag", "frames")
@@ -153,13 +139,14 @@ class OnlineServerTest(unittest.TestCase):
         w = WS()
         w.c.sock.sendall(ws_frame(b"not json", OP_TEXT, mask=True)
                          + ws_frame(b"[1,2,3]", OP_TEXT, mask=True))
-        w.send(type="ping")
-        self.assertEqual(w.c.recv()["type"], "pong")          # 壞訊息被忽略，連線還在
+        w.send(type="room_info", room="x")
+        self.assertEqual(w.c.recv()["type"], "room_info")     # 壞訊息被忽略，連線還在
         w.c.sock.sendall(struct.pack("!BB", 0x81, 0xFF) + struct.pack("!Q", 1 << 40))  # 超大
         w.c.sock.settimeout(3)
         self.assertEqual(w.c.sock.recv(10), b"")               # 伺服器直接斷線
         w.close()
-        self.assertTrue(transport.request(f"ws://127.0.0.1:{PORT}", type="ping"))  # 伺服器沒事
+        self.assertTrue(transport.request(f"ws://127.0.0.1:{PORT}", type="room_info",
+                                          room="x"))          # 伺服器沒事
 
     def test_restore_only_once(self):
         a, b = WS("amy", "rest"), WS("ben", "rest")
@@ -185,26 +172,23 @@ class TransportTest(unittest.TestCase):
         P = transport.parse_server
         self.assertEqual(P("wss://wb.onrender.com"), ("wss", "wb.onrender.com", 443, "/"))
         self.assertEqual(P("ws://1.2.3.4:8080/ws?x=1"), ("ws", "1.2.3.4", 8080, "/ws?x=1"))
-        self.assertEqual(P("192.168.1.5:9100"), ("tcp", "192.168.1.5", 9100, "/"))
-        self.assertEqual(P("192.168.1.5"), ("tcp", "192.168.1.5", 9100, "/"))
-        for bad in ("http://x", "ws://"):
+        self.assertEqual(P(" https://wb.onrender.com/ "), ("wss", "wb.onrender.com", 443, "/"))
+        for bad in ("ftp://x", "wb.onrender.com", "ws://"):
             with self.assertRaises(ValueError):
                 P(bad)
-        self.assertTrue(transport.is_online(" WSS://x "))
-        self.assertFalse(transport.is_online("1.2.3.4:9100"))
 
     def test_mask_roundtrip(self):
         key = b"\x01\x02\x03\x04"
-        for n in (0, 5, 4095, 4096, 100001):
+        for n in (0, 1, 5, 4096, 100001):
             data = os.urandom(n)
-            self.assertEqual(transport._unmask(transport._unmask(data, key), key), data)
-            self.assertEqual(transport._xor_mask(data, key) if n else b"",
-                             bytes(b ^ key[i % 4] for i, b in enumerate(data)))
+            masked = transport.mask_bytes(data, key)
+            self.assertEqual(masked, bytes(b ^ key[i % 4] for i, b in enumerate(data)))
+            self.assertEqual(transport.mask_bytes(masked, key), data)
 
     def test_env_port_and_wrong_url(self):
         p = start_server(9243, env_port=True)                  # 雲端平台用環境變數 PORT
         try:
-            self.assertEqual(transport.request("ws://127.0.0.1:9243", type="ping")["port"], 9243)
+            self.assertTrue(transport.request("ws://127.0.0.1:9243", type="create_room")["code"])
         finally:
             p.terminate(); p.wait()
         srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen()   # 不是白板的網站

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""客戶端邏輯測試 (不需要螢幕)。
+"""客戶端與啟動視窗測試 (不需要螢幕)。
 
-用一個簡化的假 tkinter 取代真正的 GUI，讓兩個 App 透過「真的伺服器」互相協作，
-驗證畫筆、文字框、選取 / 移動、複製 / 剪下 / 貼上 / 刪除、存檔讀檔等流程。
+用一個簡化的假 tkinter 取代真正的 GUI，讓多個 App 透過「真的伺服器」互相協作，驗證畫筆、
+文字框、選取 / 移動 / 縮放、複製 / 剪下 / 貼上 / 刪除、右鍵選單、存檔讀檔、伺服器重啟後
+的復原，以及 start.py 的啟動視窗 (建立房間 / 輸入房間號加入)。
 
     python3 test_client.py
 """
@@ -68,9 +69,8 @@ class Tk(Widget):
 
     on_mainloop = None                         # 測試用：mainloop 時要執行的動作
 
-    def title(self, t): pass
+    def title(self, t): self.title_text = t
     def resizable(self, *a): pass
-    def update_idletasks(self): pass
     def mainloop(self):
         if Tk.on_mainloop:
             Tk.on_mainloop(self)
@@ -236,9 +236,8 @@ class Canvas(Widget):
 def install_fake_tk():
     tk = types.ModuleType("tkinter")
     for name, val in dict(Tk=Tk, Canvas=Canvas, Text=Text, Menu=Menu, Frame=Widget,
-                          Radiobutton=Widget, Button=Widget,
-                          Label=Widget, Scale=Widget, Spinbox=Widget, Entry=Widget,
-                          IntVar=Var, StringVar=Var, TclError=TclError).items():
+                          Button=Widget, Label=Widget, Scale=Widget, IntVar=Var, StringVar=Var,
+                          TclError=TclError).items():
         setattr(tk, name, val)
     for c in ("LEFT", "RIGHT", "TOP", "BOTTOM", "X", "BOTH", "RAISED", "SUNKEN",
               "SOLID", "ROUND", "HORIZONTAL", "NORMAL", "DISABLED"):
@@ -282,7 +281,7 @@ class Board:
 
     def __init__(self, name, room, server=None):
         self.root = fake_tk.Tk()
-        self.net = client.Net(server or f"127.0.0.1:{PORT}", name, room, client.queue.Queue())
+        self.net = client.Net(server or f"ws://127.0.0.1:{PORT}", name, room, client.queue.Queue())
         self.app = client.App(self.root, self.net, self.net.inbox)
         self.c = self.app.canvas
         self.net.start()
@@ -641,8 +640,7 @@ class RestartTest(unittest.TestCase):
     PORT = 9195
 
     def start(self):
-        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(self.PORT),
-                              "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(self.PORT)], cwd=HERE, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 socket.create_connection(("127.0.0.1", self.PORT), timeout=0.2).close()
@@ -694,7 +692,7 @@ class LauncherTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port",
-                                  str(cls.PORT), "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
+                                  str(cls.PORT)], cwd=HERE, stderr=subprocess.DEVNULL)
         time.sleep(0.8)
 
     @classmethod
@@ -758,6 +756,42 @@ class LauncherTest(unittest.TestCase):
         a.app.set_tool("text")
         a.app.on_press(ev(400, 300)); a.app.editor["w"].type("線上你好"); a.app.commit_editor()
         b.wait(lambda: any(o.get("text") == "線上你好" for o in b.app.strokes.values()))
+
+    def test_main_opens_whiteboard_in_same_process(self):
+        """start.py 不帶參數：啟動視窗 -> 建立房間 -> 同一個程式裡開白板 (打包成執行檔需要)。"""
+        import start
+        roots, apps = [], []
+        real_app = client.App
+
+        def record_app(*a):
+            apps.append(real_app(*a))
+            return apps[-1]
+
+        def mainloop(root):
+            roots.append(root)
+            if len(roots) == 1:                                # 第一個視窗：啟動視窗
+                self.parts(root)[0].set("amy")
+                root.button("建立房間").kw["command"]()
+                root.pump(lambda: root.destroyed)
+            else:                                              # 第二個視窗：白板
+                apps[0].net.inbox.put({"type": "_noop"})
+                end = time.monotonic() + 6
+                while not apps[0].online and time.monotonic() < end:
+                    apps[0].poll()
+                    time.sleep(0.02)
+        client.App = record_app
+        fake_tk.Tk.on_mainloop = mainloop
+        try:
+            start.main(["--server", self.SERVER])
+        finally:
+            fake_tk.Tk.on_mainloop = None
+            client.App = real_app
+        app = apps[0]
+        self.addCleanup(app.net.stop)
+        self.assertEqual(len(roots), 2)
+        self.assertTrue(app.online)
+        self.assertEqual((app.my_name, len(app.code)), ("amy", 5))
+        self.assertIn(app.code, roots[1].title_text)           # 白板標題顯示房間號
 
     def test_no_server_configured(self):
         seen = {}

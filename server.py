@@ -1,48 +1,39 @@
 #!/usr/bin/env python3
-"""協作白板伺服器 (TCP + asyncio)
+"""協作白板伺服器 (asyncio + WebSocket)
 
-- 每個房間各自保存筆跡，新加入者會收到完整重播
-- 收到的筆跡依伺服器接收順序轉發給同房間其他人 (伺服器順序即為最終順序)
-- 物件有筆跡與文字兩種；任何人都能移動 / 刪除 / 編輯文字，復原只會移除「自己」最後新增的物件
-- 同一個 port 同時支援三種連線 (看第一行自動判斷)：
-    一行 JSON          -> 原本的 TCP 協定 (區域網路的 client.py)
-    HTTP + Upgrade     -> WebSocket (線上：雲端平台只轉發 HTTP / WebSocket)
-    一般 HTTP GET      -> 回傳狀態頁 (雲端平台的健康檢查)
-- create_room 產生隨機房間號；--public (雲端部署用) 時 pong 不公開房間清單、空房間保留
+- 每個房間各自保存畫布上的物件 (筆跡、文字)，新加入者會收到完整畫面
+- 訊息依伺服器接收順序轉發給同房間其他人，伺服器的順序就是最終順序
+- 任何人都能移動 / 縮放 / 刪除物件、編輯文字；復原只會移除自己最後新增的物件
+- 一般 HTTP 請求回傳狀態頁 (雲端平台的健康檢查)，WebSocket 請求進入白板協定
 
-    python3 server.py --public             # 雲端 (Render 會用這個指令，port 取自環境變數 PORT)
-    python3 server.py                      # 開發 / 測試：在本機執行 (預設 port 9100)
+    python3 server.py              # port 取自環境變數 PORT (Render 會設定)，沒有則 9100
 """
 import argparse
 import asyncio
-import json
 import logging
 import os
 import re
 import secrets
-import socket
 import time
 from collections import OrderedDict
 
+from protocol import (DEFAULT_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MAX_WIDTH, MIN_FONT,
+                      clamp01, clamp_move, clamp_scale, clean_obj, decode, encode, is_text,
+                      move_obj, scale_obj, valid_color)
 from transport import MAX_MESSAGE, read_http_headers, ws_accept_key, ws_frame, ws_read_message
-from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
-                      clamp_move, clamp_scale, clean_obj, decode, encode, is_text, move_obj,
-                      scale_obj, valid_color)
 
 MAX_NAME = 16
 MAX_ROOM = 20
-MAX_STROKES = 5000          # 每房間物件上限，超過就丟掉最舊的
-MAX_SIDS_PER_MSG = MAX_STROKES
-MAX_ROOMS = 500
+MAX_SID = 40
+MAX_STROKES = 5000          # 每個房間的物件上限，超過就丟掉最舊的
+MAX_ROOMS = 500             # 房間數上限，超過就清掉最久沒人用的空房間
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford Base32 (不含 I L O U)
 CODE_LEN = 5
-HTTP_METHODS = (b"GET ", b"HEAD ", b"POST ", b"PUT ", b"OPTIONS ", b"DELETE ", b"PATCH ")
 
 
 class Client:
     def __init__(self, writer):
         self.writer = writer
-        self.ws = False                     # True = WebSocket 連線
         self.name = None
         self.room = None
         self.addr = writer.get_extra_info("peername")
@@ -51,25 +42,14 @@ class Client:
 class Room:
     def __init__(self, name):
         self.name = name
-        self.users = {}                    # name -> Client
-        self.strokes = OrderedDict()       # sid -> stroke dict
-        self.touched = time.monotonic()    # 最後有人使用的時間 (清理閒置房間用)
+        self.users = {}                    # 暱稱 -> Client
+        self.strokes = OrderedDict()       # sid -> 物件 (畫布由下到上的順序)
+        self.touched = time.monotonic()    # 最後有人使用的時間
 
 
 class WhiteboardServer:
-    def __init__(self, port=DEFAULT_PORT, public=False):
+    def __init__(self):
         self.rooms = {}
-        self.port = port
-        self.public = public
-
-    def info(self):
-        users = sum(len(r.users) for r in self.rooms.values())
-        if self.public:                     # 線上伺服器不公開房間號
-            return {"type": "pong", "app": APP_ID, "port": self.port, "host": "online",
-                    "users": users, "rooms": {}, "public": True}
-        return {"type": "pong", "app": APP_ID, "port": self.port, "host": socket.gethostname(),
-                "users": users,
-                "rooms": {n: len(r.users) for n, r in self.rooms.items() if r.users}}
 
     def new_room_code(self):
         self.purge_rooms()
@@ -90,7 +70,7 @@ class WhiteboardServer:
     # ---------- 傳送 ----------
     async def send(self, c, data: bytes):
         try:
-            c.writer.write(ws_frame(data[:-1]) if c.ws else data)
+            c.writer.write(ws_frame(data))
             await asyncio.wait_for(c.writer.drain(), timeout=5)
         except Exception:
             pass  # 斷線的連線由讀取迴圈清理
@@ -104,15 +84,11 @@ class WhiteboardServer:
     async def handle(self, reader, writer):
         c = Client(writer)
         try:
-            first = await reader.readline()
-            if first.startswith(HTTP_METHODS):
-                await self.handle_http(c, reader, writer, first)
-                return
-            logging.info("連線 (TCP): %s", c.addr)
-            line = first
-            while line:                             # 原本的「一行一則 JSON」協定
-                await self.handle_raw(c, line)
-                line = await reader.readline()
+            method, path, headers = await read_http_headers(reader, await reader.readline())
+            if "websocket" in headers.get("upgrade", "").lower() and "sec-websocket-key" in headers:
+                await self.handle_ws(c, reader, writer, headers)
+            else:
+                await self.handle_http(writer, method, path)
         except (ConnectionError, asyncio.IncompleteReadError, asyncio.LimitOverrunError,
                 ValueError):
             pass
@@ -126,33 +102,25 @@ class WhiteboardServer:
             except Exception:
                 pass
 
-    async def handle_raw(self, c, raw: bytes):
-        try:
-            msg = decode(raw)
-        except (ValueError, UnicodeDecodeError):
-            return
-        if isinstance(msg, dict):
-            await self.dispatch(c, msg)
+    async def handle_ws(self, c, reader, writer, headers):
+        accept = ws_accept_key(headers["sec-websocket-key"])
+        writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                      f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+        await writer.drain()
+        logging.info("連線: %s", headers.get("x-forwarded-for", c.addr))
+        while (data := await ws_read_message(reader, writer)) is not None:
+            try:
+                msg = decode(data)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(msg, dict):
+                await self.dispatch(c, msg)
 
-    async def handle_http(self, c, reader, writer, first):
-        method, path, headers = await read_http_headers(reader, first)
-        if "websocket" in headers.get("upgrade", "").lower() and "sec-websocket-key" in headers:
-            accept = ws_accept_key(headers["sec-websocket-key"])
-            writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                          "Connection: Upgrade\r\n"
-                          f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
-            await writer.drain()
-            c.ws = True
-            logging.info("連線 (WebSocket): %s", headers.get("x-forwarded-for", c.addr))
-            while True:
-                data = await ws_read_message(reader, writer)
-                if data is None:
-                    return
-                await self.handle_raw(c, data)
-        # 一般 HTTP：狀態頁 / 健康檢查
-        info = self.info()
+    async def handle_http(self, writer, method, path):
+        """狀態頁 / 健康檢查。"""
         if path.split("?")[0] in ("/", "/healthz"):
-            body = (f"collab-whiteboard server OK\nonline users: {info['users']}\n"
+            users = sum(len(r.users) for r in self.rooms.values())
+            body = (f"collab-whiteboard server OK\nonline users: {users}\n"
                     f"rooms: {len(self.rooms)}\n").encode()
             status = "200 OK"
         else:
@@ -162,13 +130,11 @@ class WhiteboardServer:
                      + (b"" if method == "HEAD" else body))
         await writer.drain()
 
+    # ---------- 訊息處理 ----------
     async def dispatch(self, c, msg):
         t = msg.get("type")
         if t == "hello":
             await self.hello(c, msg)
-            return
-        if t == "ping":
-            await self.send(c, encode(**self.info()))
             return
         if t == "create_room":
             await self.send(c, encode(type="room_created", code=self.new_room_code()))
@@ -231,12 +197,13 @@ class WhiteboardServer:
         elif t == "clear":
             room.strokes.clear()
             await self.broadcast(room, type="clear", by=c.name)
+        # heartbeat 等其他訊息：只用來表示連線還活著，不需處理
 
     async def hello(self, c, msg):
         if c.room is not None:
             await self.leave(c)
         base = re.sub(r"\s+", "_", str(msg.get("name", "")).strip())[:MAX_NAME] or "guest"
-        room_name = str(msg.get("room", "lobby")).strip()[:MAX_ROOM] or "lobby"
+        room_name = str(msg.get("room", "")).strip()[:MAX_ROOM] or "lobby"
         room = self.rooms.setdefault(room_name, Room(room_name))
         name, i = base, 2
         while name in room.users:           # 暱稱重複就自動加編號
@@ -249,11 +216,17 @@ class WhiteboardServer:
         await self.broadcast(room, exclude=c, type="user_join", name=name)
         logging.info("%s 加入 [%s] (%d 人)", name, room_name, len(room.users))
 
+    def add_object(self, room, sid, obj):
+        room.strokes[sid] = obj
+        while len(room.strokes) > MAX_STROKES:
+            room.strokes.popitem(last=False)
+
     async def draw(self, c, room, msg):
+        """新增筆跡，或接續自己正在畫的筆跡。"""
         try:
-            sid = str(msg["sid"])[:40]
+            sid = str(msg["sid"])[:MAX_SID]
             color = valid_color(msg.get("color"))
-            width = int(min(60, max(1, int(msg.get("width", 3)))))
+            width = min(MAX_WIDTH, max(1, int(msg.get("width", 3))))
             pts = [[clamp01(p[0]), clamp01(p[1])] for p in msg["pts"][:MAX_PTS_PER_MSG]]
         except (KeyError, TypeError, ValueError, IndexError):
             return
@@ -261,24 +234,43 @@ class WhiteboardServer:
             return
         s = room.strokes.get(sid)
         if s is None:
-            s = room.strokes[sid] = dict(sid=sid, owner=c.name, color=color, width=width, pts=[])
-            while len(room.strokes) > MAX_STROKES:
-                room.strokes.popitem(last=False)
+            s = dict(sid=sid, owner=c.name, color=color, width=width, pts=[])
+            self.add_object(room, sid, s)
         elif is_text(s) or s["owner"] != c.name:
             return                          # 不能接續別人的筆跡
         s["pts"].extend(pts)
         await self.broadcast(room, exclude=c, type="draw", sid=sid, owner=c.name,
                              color=s["color"], width=s["width"], pts=pts)
 
+    async def text(self, c, room, msg):
+        """新增文字框；sid 已存在時代表修改內容 / 顏色 / 字級 (位置以伺服器為準)。"""
+        try:
+            sid = str(msg["sid"])[:MAX_SID]
+            text = str(msg.get("text", ""))[:MAX_TEXT]
+            size = min(MAX_FONT, max(MIN_FONT, int(msg.get("size", 20))))
+            x, y = clamp01(msg["x"]), clamp01(msg["y"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if not text.strip():
+            return
+        s = room.strokes.get(sid)
+        if s is None:
+            s = dict(sid=sid, owner=c.name, kind="text", x=x, y=y)
+            self.add_object(room, sid, s)
+        elif not is_text(s):
+            return                          # 不能把筆跡改成文字
+        s.update(text=text, color=valid_color(msg.get("color")), size=size)
+        await self.broadcast(room, exclude=c, type="text", **s)
+
     async def restore(self, c, room, msg):
         """伺服器重啟後房間是空的：接受第一個重新連上的人傳回的畫面，並同步給所有人。"""
         if room.strokes or not isinstance(msg.get("strokes"), list):
-            return                              # 房間已經有內容 (別人先復原了) -> 忽略
+            return                          # 房間已經有內容 (別人先復原了)
         for s in msg["strokes"][:MAX_STROKES]:
             if not isinstance(s, dict):
                 continue
             o = clean_obj(s)
-            sid = str(s.get("sid", ""))[:40]
+            sid = str(s.get("sid", ""))[:MAX_SID]
             if o and sid and sid not in room.strokes:
                 o["sid"] = sid
                 o["owner"] = str(s.get("owner") or c.name)[:MAX_NAME + 4]
@@ -292,29 +284,7 @@ class WhiteboardServer:
         sids = msg.get("sids")
         if not isinstance(sids, list):
             return []
-        return list(dict.fromkeys(str(x)[:40] for x in sids[:MAX_SIDS_PER_MSG]))
-
-    async def text(self, c, room, msg):
-        """新增文字框；sid 已存在時代表修改文字內容 / 顏色 / 字級 (位置以伺服器為準)。"""
-        try:
-            sid = str(msg["sid"])[:40]
-            text = str(msg.get("text", ""))[:MAX_TEXT]
-            size = min(MAX_FONT, max(MIN_FONT, int(msg.get("size", 20))))
-            x, y = clamp01(msg["x"]), clamp01(msg["y"])
-        except (KeyError, TypeError, ValueError):
-            return
-        if not text.strip():
-            return
-        color = valid_color(msg.get("color"))
-        s = room.strokes.get(sid)
-        if s is None:
-            s = room.strokes[sid] = dict(sid=sid, owner=c.name, kind="text", x=x, y=y)
-            while len(room.strokes) > MAX_STROKES:
-                room.strokes.popitem(last=False)
-        elif not is_text(s):
-            return                          # 不能把筆跡改成文字
-        s.update(text=text, color=color, size=size)
-        await self.broadcast(room, exclude=c, type="text", **s)
+        return list(dict.fromkeys(str(x)[:MAX_SID] for x in sids[:MAX_STROKES]))
 
     async def leave(self, c):
         if c.room is None:
@@ -322,11 +292,9 @@ class WhiteboardServer:
         room = self.rooms.get(c.room)
         if room and room.users.get(c.name) is c:
             del room.users[c.name]
+            room.touched = time.monotonic()
             await self.broadcast(room, type="user_leave", name=c.name)
             logging.info("%s 離開 [%s]", c.name, c.room)
-            room.touched = time.monotonic()
-            if not room.users and not room.strokes and not self.public:
-                del self.rooms[c.room]
         c.room = None
 
 
@@ -334,16 +302,14 @@ async def main():
     ap = argparse.ArgumentParser(description="協作白板伺服器")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", DEFAULT_PORT)),
-                    help="TCP port (預設讀環境變數 PORT，沒有則 9100)")
-    ap.add_argument("--public", action="store_true",
-                    help="部署到雲端時使用 (不公開房間清單、空房間保留)")
+                    help="預設讀環境變數 PORT，沒有則 9100")
+    ap.add_argument("--public", action="store_true", help=argparse.SUPPRESS)  # 舊的啟動指令相容
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    srv = WhiteboardServer(args.port, public=args.public)
+    srv = WhiteboardServer()
     server = await asyncio.start_server(srv.handle, args.host, args.port, limit=MAX_MESSAGE)
-    logging.info("白板伺服器啟動於 port %d%s", args.port, " (public)" if args.public else "")
-    if not args.public:
-        logging.info("本機測試：python3 start.py --server ws://127.0.0.1:%d", args.port)
+    logging.info("白板伺服器啟動於 port %d (本機測試：python3 start.py --server ws://127.0.0.1:%d)",
+                 args.port, args.port)
     async with server:
         await server.serve_forever()
 

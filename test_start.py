@@ -27,8 +27,7 @@ def run(*args, env=None):
 class StartTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(PORT),
-                                  "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
+        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(PORT)], cwd=HERE, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()

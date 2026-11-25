@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""協作白板 GUI 客戶端 (tkinter + socket)
+"""協作白板 GUI 客戶端 (tkinter + WebSocket)，一般由 start.py 啟動。
 
 執行緒模型：
-  - 網路執行緒 (Net)：負責連線、自動重連、讀取伺服器訊息 -> 放進 queue
+  - 網路執行緒 (Net)：連線、自動重連、讀取伺服器訊息 -> 放進 queue
   - 主執行緒 (tkinter)：每 15ms 從 queue 取訊息更新畫面 (tkinter 只能在主執行緒操作)
 效能：滑鼠拖曳時先在本機畫出，點座標累積起來每 30ms 批次送出一次。
 
-工具：畫筆 / 橡皮擦 / 文字 / 選取 (移動、複製、剪下、貼上、刪除)
+工具：畫筆 / 橡皮擦 / 文字 / 選取 (移動、縮放、複製、剪下、貼上、刪除)
 """
 import argparse
 import json
 import queue
-import socket
 import sys
 import threading
 import time
@@ -21,11 +20,9 @@ import zlib
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
-from transport import (ConnectionClosed, configured_server, is_online, open_connection,
-                       parse_server)
-from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
-                      clamp_scale, decode, dump_board, encode, is_text, move_obj,
-                      objects_bbox, parse_board, scale_obj)
+from protocol import (APP_ID, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move, clamp_scale,
+                      dump_board, is_text, move_obj, objects_bbox, parse_board, scale_obj)
+from transport import ConnectionClosed, configured_server, open_connection
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -38,13 +35,11 @@ HEARTBEAT_MS = 25000    # 心跳間隔：讓雲端平台知道還有人在用，
 
 # ====================== 網路執行緒 ======================
 class Net(threading.Thread):
-    """網路執行緒：連線 (TCP 或 WebSocket)、自動重連、把收到的訊息放進 queue。"""
+    """網路執行緒：連線、自動重連、把收到的訊息放進 queue。"""
 
     def __init__(self, server, name, room, inbox):
         super().__init__(daemon=True)
         self.server, self.name, self.room = server, name, room
-        self.online_mode = is_online(server)
-        _, self.host, self.port, _ = parse_server(server)
         self.inbox = inbox
         self.conn = None
         self.lock = threading.Lock()
@@ -54,11 +49,10 @@ class Net(threading.Thread):
         first = True
         while self.running:
             try:
-                # 線上伺服器休眠時，第一次連線要等它喚醒 (約 1 分鐘)
-                timeout = 90 if self.online_mode and first else 10
-                if self.online_mode and first:
+                # 伺服器休眠時，第一次連線要等它喚醒 (約 1 分鐘)
+                if first:
                     self.inbox.put({"type": "_status", "online": False, "waking": True})
-                conn = open_connection(self.server, timeout=timeout)
+                conn = open_connection(self.server, timeout=90 if first else 10)
                 conn.settimeout(None)
                 with self.lock:
                     self.conn = conn
@@ -67,15 +61,17 @@ class Net(threading.Thread):
                 first = False
                 while True:
                     self.inbox.put(conn.recv())
-            except (OSError, ConnectionClosed) as e:
-                if first:
-                    self.inbox.put({"type": "_status", "online": False, "error": str(e)})
+            except (OSError, ValueError, ConnectionClosed) as e:
+                error = str(e) or e.__class__.__name__
             with self.lock:
                 c, self.conn = self.conn, None
             if c:
                 c.close()
             if self.running:
-                self.inbox.put({"type": "_status", "online": False})
+                status = {"type": "_status", "online": False}
+                if first:                   # 從沒連上過：顯示原因
+                    status["error"] = error
+                self.inbox.put(status)
                 time.sleep(RECONNECT_SEC)   # 自動重連
 
     def send(self, **obj):
@@ -123,9 +119,9 @@ def text_width_units(line):
 
 
 class App:
-    def __init__(self, root, net, inbox, code=None):
+    def __init__(self, root, net, inbox):
         self.root, self.net, self.inbox = root, net, inbox
-        self.code = code or net.room       # 房間號 (就是房間名稱)
+        self.code = net.room       # 房間號
         self.welcomed = False      # 收過 welcome 了嗎 (用來判斷是否為「重新」連線)
         self.my_name = net.name
         self.online = False
@@ -1078,27 +1074,30 @@ class App:
         self.root.destroy()
 
 
-def main():
-    ap = argparse.ArgumentParser(description="協作白板客戶端 (一般請用 start.py 啟動)")
-    ap.add_argument("--server", help="伺服器網址 (預設讀 config.json)，例如 wss://xxx.onrender.com")
-    ap.add_argument("--name", help="暱稱 (未指定會詢問)")
-    ap.add_argument("--room", required=True, help="房間號 (通常由 start.py 帶入)")
-    args = ap.parse_args()
-
+def run(server, room, name=None):
+    """開啟白板視窗，直到使用者關閉。"""
     root = tk.Tk()
-    name = args.name
     if not name:
         root.withdraw()
         name = simpledialog.askstring("協作白板", "請輸入暱稱:", parent=root) or "guest"
         root.deiconify()
     inbox = queue.Queue()
-    server = args.server or configured_server()
-    if not server:
-        sys.exit("沒有設定伺服器網址：請用 --server 或在 config.json 填入")
-    net = Net(server, name, args.room, inbox)
+    net = Net(server, name, room, inbox)
     App(root, net, inbox)
     net.start()
     root.mainloop()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="協作白板客戶端 (一般請用 start.py 啟動)")
+    ap.add_argument("--server", help="伺服器網址 (預設讀 config.json)，例如 wss://xxx.onrender.com")
+    ap.add_argument("--name", help="暱稱 (未指定會詢問)")
+    ap.add_argument("--room", required=True, help="房間號")
+    args = ap.parse_args()
+    server = configured_server(args.server)
+    if not server:
+        sys.exit("沒有設定伺服器網址：請用 --server 或在 config.json 填入")
+    run(server, args.room, args.name)
 
 
 if __name__ == "__main__":

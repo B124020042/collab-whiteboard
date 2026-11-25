@@ -1,4 +1,4 @@
-"""共用通訊協定：每則訊息是一行 UTF-8 JSON，以 \\n 結尾。
+"""共用通訊協定：每則訊息是一個 UTF-8 JSON 物件 (走 WebSocket，一則訊息一個 text frame)。
 
 座標一律使用 0~1 的比例座標，讓不同視窗大小的客戶端畫面一致。
 畫布上的「物件」有兩種，用同一組 sid 管理：
@@ -13,7 +13,6 @@ client -> server
   {"type":"scale",  "sids":[...], "ox", "oy", "sx", "sy"}                   # 以 (ox,oy) 為基準縮放
   {"type":"delete", "sids":[...]}                                           # 刪除物件
   {"type":"cursor", "x", "y"}
-  {"type":"ping"}                      # 探測伺服器 (不需先 hello)，回覆 pong
   {"type":"create_room"}               # 建立新房間，回覆 room_created
   {"type":"room_info", "room"}         # 查詢房間是否存在，回覆 room_info
   {"type":"restore", "strokes":[...]}  # 伺服器重啟後房間是空的：把本機畫面傳回去復原
@@ -30,7 +29,6 @@ server -> client
   {"type":"scale",     "sids", "ox", "oy", "sx", "sy"}
   {"type":"cursor",    "name", "x", "y"}
   {"type":"remove",    "sid"}          {"type":"clear", "by"}
-  {"type":"pong",      "app", "port", "users", "rooms":{房間: 人數}, "host"}
   {"type":"room_created", "code"}      {"type":"room_info", "room", "exists", "users"}
   {"type":"reset",     "strokes", "by"}   # 畫面被整個復原 (等同重新 welcome)
   {"type":"error",     "text"}
@@ -51,13 +49,13 @@ COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 def encode(**obj) -> bytes:
-    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def decode(line):
-    if isinstance(line, bytes):
-        line = line.decode("utf-8")
-    return json.loads(line)
+def decode(data):
+    if isinstance(data, bytes):
+        data = data.decode("utf-8")
+    return json.loads(data)
 
 
 def clamp01(v):

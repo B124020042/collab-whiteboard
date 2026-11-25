@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""自動化測試：啟動伺服器，用多個原始 socket 客戶端驗證同步邏輯。
+"""伺服器測試：啟動伺服器，用多個 WebSocket 客戶端驗證同步邏輯、權限與防呆。
 
     python3 test_server.py
 """
-import select
+import json
 import socket
 import subprocess
 import sys
@@ -11,40 +11,36 @@ import time
 import unittest
 from pathlib import Path
 
-import json
-
-from protocol import (chunk_pts, clamp_move, decode, dump_board, encode, move_obj, objects_bbox,
-                      parse_board)
+from protocol import chunk_pts, clamp_move, dump_board, move_obj, objects_bbox, parse_board
+from transport import OP_TEXT, ConnectionClosed, open_connection, ws_frame
 
 HERE = Path(__file__).resolve().parent
 PORT = 9177
 
 
 class C:
-    """測試用客戶端：自己管理接收緩衝區，可安全地做「一段時間內沒收到」的檢查。"""
+    """測試用客戶端：可以等待特定訊息，或確認一段時間內沒收到某種訊息。"""
 
     def __init__(self, name, room="lobby"):
-        self.s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
-        self.buf = b""
+        self.conn = open_connection(f"ws://127.0.0.1:{PORT}", timeout=3)
         self.send(type="hello", name=name, room=room)
         self.welcome = self.until("welcome")
         self.name = self.welcome["name"]
 
     def send(self, **o):
-        self.s.sendall(encode(**o))
+        self.conn.send(**o)
+
+    def send_raw(self, payload: bytes):
+        self.conn.sock.sendall(ws_frame(payload, OP_TEXT, mask=True))
 
     def recv(self, timeout=3):
-        deadline = time.monotonic() + timeout
-        while b"\n" not in self.buf:
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.s], [], [], left)[0]:
-                raise TimeoutError("timed out")
-            data = self.s.recv(65536)
-            if not data:
-                raise ConnectionError("closed")
-            self.buf += data
-        line, self.buf = self.buf.split(b"\n", 1)
-        return decode(line)
+        self.conn.settimeout(timeout)
+        try:
+            return self.conn.recv()
+        except socket.timeout:
+            raise TimeoutError("timed out")
+        except ConnectionClosed:
+            raise ConnectionError("closed")
 
     def until(self, t, pred=lambda m: True):
         for _ in range(500):
@@ -65,7 +61,7 @@ class C:
         return True
 
     def close(self):
-        self.s.close()
+        self.conn.close()
 
 
 class WhiteboardTest(unittest.TestCase):
@@ -141,7 +137,8 @@ class WhiteboardTest(unittest.TestCase):
     def test_bad_input_does_not_crash(self):
         watcher = C("watcher", "r5")
         c = C("evil", "r5")
-        c.s.sendall(b"not json\n{\"type\":\"draw\"}\n[1,2]\n")
+        for raw in (b"not json", b'{"type":"draw"}', b"[1,2]"):
+            c.send_raw(raw)
         c.send(type="draw", sid="q", color="red;rm", width=9999, pts=[["a", 1]])
         c.send(type="draw", sid="ok", color="javascript", width=9999, pts=[[2, -1]])
         watcher.until("draw")

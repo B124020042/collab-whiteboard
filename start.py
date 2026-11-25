@@ -14,14 +14,11 @@ import argparse
 import getpass
 import re
 import socket
-import subprocess
 import sys
-from pathlib import Path
 
 import transport
 from transport import configured_server
 
-HERE = Path(__file__).resolve().parent
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford Base32 (不含 I L O U)
 CODE_LEN = 5
 WAKE_HINT = "(伺服器休眠時第一次約需 1 分鐘)"
@@ -84,11 +81,9 @@ def join_room(server, code):
 
 
 def run_client(server, room, name=None):
-    cmd = [sys.executable, str(HERE / "client.py"), "--server", server, "--room", room]
-    if name:
-        cmd += ["--name", name]
+    import client                               # 用到才載入 tkinter (--check 不需要)
     try:
-        subprocess.run(cmd, cwd=HERE)
+        client.run(server, room, name)
     except KeyboardInterrupt:
         pass
 
