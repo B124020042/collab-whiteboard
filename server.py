@@ -36,6 +36,7 @@ MAX_SIDS_PER_MSG = MAX_STROKES
 MAX_ROOMS = 500
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford Base32 (不含 I L O U)
 CODE_LEN = 5
+CODE_FIRST = "".join(ch for ch in CODE_ALPHABET if ch not in "ABCD")  # A~D 開頭留給區網房間號
 HTTP_METHODS = (b"GET ", b"HEAD ", b"POST ", b"PUT ", b"OPTIONS ", b"DELETE ", b"PATCH ")
 
 
@@ -88,7 +89,8 @@ class WhiteboardServer:
     def new_room_code(self):
         self.purge_rooms()
         while True:
-            code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+            code = secrets.choice(CODE_FIRST) + "".join(
+                secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN - 1))
             if code not in self.rooms:
                 self.rooms[code] = Room(code)
                 return code

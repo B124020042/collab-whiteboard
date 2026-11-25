@@ -60,6 +60,10 @@ python3 start.py
   - 還開著白板的人重新連上時，會自動把畫面傳回伺服器復原，不用做任何事。
   - 如果大家都關掉了，房間號就失效，要重新建立房間。想保留畫面請先「儲存」成 `.json`，之後「開啟」即可。
 
+加入時不用選模式：程式會依房間號自動判斷。**線上房間號的開頭不會是 A~D**，A~D 開頭的是區網房間號。
+
+> 輸入線上房間號卻出現「這台電腦還沒設定線上伺服器」：代表這台的 `config.json` 還是空的。請在填好網址的那台把 `config.json` **commit 並 push**，這台再 `git pull`。
+
 指令版：`python3 start.py create`、`python3 start.py join K7Q2M`；暫時不想用線上時加 `--lan`。
 沒有修改 `config.json` 也可以用 `--server wss://...` 或環境變數 `WHITEBOARD_SERVER` 指定伺服器。
 

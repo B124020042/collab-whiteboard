@@ -319,6 +319,38 @@ def print_code(code, port, room):
     print()
 
 
+NO_SERVER_HINT = ("這是線上房間號，但這台電腦還沒設定線上伺服器。\n"
+                  "請在設定好的那台把 config.json commit 並 push，這台再 git pull；\n"
+                  "或執行  python3 start.py --server wss://你的網址.onrender.com")
+
+
+def code_kind(code):
+    """依房間號判斷：A~D 開頭 = 區網 (IP 編碼)，其他 = 線上。"""
+    first = re.sub(r"\s+", "", str(code))[:1].upper()
+    return "lan" if first in "ABCD" and first else "online"
+
+
+def smart_join(server, code):
+    """不用選模式，依房間號自動決定怎麼加入。
+    回傳 ("online", 房間號) 或 ("lan", (ip, port, room, info))。"""
+    if not str(code).strip():
+        raise ValueError("請輸入房間號")
+    if code_kind(code) == "online":
+        if not server:
+            raise RuntimeError(NO_SERVER_HINT)
+        return "online", online_join(server, code)
+    try:
+        return "lan", join_target(code)
+    except (ValueError, RuntimeError) as lan_error:
+        # 舊版伺服器產生的線上房間號可能以 A~D 開頭：區網找不到時再試一次線上
+        if server:
+            try:
+                return "online", online_join(server, code)
+            except (ValueError, RuntimeError):
+                pass
+        raise lan_error
+
+
 def cmd_create(name, room, port, udp_port, server=None):
     if server:                                  # 線上
         try:
@@ -343,19 +375,16 @@ def cmd_create(name, room, port, udp_port, server=None):
 
 
 def cmd_join(code, name, check=False, server=None):
-    if server:                                  # 線上
-        try:
-            code = online_join(server, code)
-        except (ValueError, RuntimeError) as e:
-            sys.exit(str(e))
-        print(f"房間 {code} 存在 ({server})")
-        if not check:
-            run_client(server, code, name, code)
-        return
     try:
-        ip, port, room, info = join_target(code)
+        kind, value = smart_join(server, code)
     except (ValueError, RuntimeError) as e:
         sys.exit(str(e))
+    if kind == "online":
+        print(f"房間 {value} 存在 ({server})")
+        if not check:
+            run_client(server, value, name, value)
+        return
+    ip, port, room, info = value
     norm = roomcode.encode(ip, port, room)
     if info.get("old"):
         print("注意：那台的伺服器是舊版，文字框、縮放等新功能不會同步。請那台 git pull 後重開。")
@@ -391,11 +420,12 @@ def launcher_gui(server=None):
     modes.grid(row=2, column=0, columnspan=3, pady=(10, 0))
     if server:
         host = transport.parse_server(server)[1]
+        tk.Label(modes, text="建立房間：").pack(side=tk.LEFT)
         tk.Radiobutton(modes, text=f"線上 ({host})", variable=mode_var,
                        value="online").pack(side=tk.LEFT)
         tk.Radiobutton(modes, text="同一個區網", variable=mode_var, value="lan").pack(side=tk.LEFT)
     else:
-        tk.Label(modes, text="模式：同一個區網 (尚未設定線上伺服器，見 README)",
+        tk.Label(modes, text="建立房間：同一個區網 (尚未設定線上伺服器，見 README)",
                  fg="#888").pack()
     status = tk.Label(f, text="", fg="#c62828", wraplength=320, justify="left")
     buttons = []
@@ -451,19 +481,19 @@ def launcher_gui(server=None):
         if not code:
             status.config(text="請輸入房間號", fg="#c62828")
             return
-        online = mode_var.get() == "online"
-        busy("連線中…" + (" (線上伺服器休眠時第一次約需 1 分鐘)" if online else ""))
+        online = code_kind(code) == "online"      # 依房間號自動判斷，不看上面選的模式
+        busy("連線中…" + (" (線上伺服器休眠時第一次約需 1 分鐘)" if online and server else ""))
 
         def done(value, err):
             if err:
                 return fail(err)
-            if online:
-                result.update(action="online", code=value, name=name())
+            kind, v = value
+            if kind == "online":
+                result.update(action="online", code=v, name=name())
             else:
-                result.update(action="join", target=value, name=name())
+                result.update(action="join", target=v, name=name())
             root.destroy()
-        run_bg((lambda: online_join(server, code)) if online else (lambda: join_target(code)),
-               done)
+        run_bg(lambda: smart_join(server, code), done)
 
     b = tk.Button(f, text="建立房間", width=24, command=on_create)
     b.grid(row=3, column=0, columnspan=3, pady=(14, 6))
