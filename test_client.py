@@ -25,7 +25,7 @@ class TclError(Exception):
 
 
 class Var:
-    def __init__(self, value=None):
+    def __init__(self, value=""):
         self.v = value
 
     def get(self):
@@ -40,8 +40,11 @@ class Widget:
         self.master, self.kw, self.bindings = master, kw, {}
         self.root = master.root if master is not None and hasattr(master, "root") else self
         self.destroyed = False
+        if self.root is not self:
+            self.root.widgets.append(self)
 
     def pack(self, **kw): pass
+    def grid(self, **kw): pass
     def config(self, **kw): self.kw.update(kw)
     configure = config
     def bind(self, seq, fn): self.bindings[seq] = fn
@@ -59,9 +62,19 @@ class Tk(Widget):
     def __init__(self):
         super().__init__(None)
         self.root, self.focused, self.clipboard = self, None, None
+        self.widgets = []
         self.tk = types.SimpleNamespace(call=lambda *a: "x11")
 
+    on_mainloop = None                         # 測試用：mainloop 時要執行的動作
+
     def title(self, t): pass
+    def resizable(self, *a): pass
+    def update_idletasks(self): pass
+    def mainloop(self):
+        if Tk.on_mainloop:
+            Tk.on_mainloop(self)
+    def button(self, text):
+        return next(w for w in self.widgets if w.kw.get("text") == text)
     def geometry(self, g): pass
     def protocol(self, name, fn): pass
     def after(self, ms, fn=None): return None
@@ -504,6 +517,13 @@ class ClientTest(unittest.TestCase):
         o = next(iter(B.strokes.values()))
         self.assertEqual((o["x"], o["y"]), (0.3, 0.2))
 
+    def test_room_code_shown(self):
+        self.assertEqual(self.a.app.code,
+                         client.roomcode.encode(client.local_ip(), PORT, self.room))
+        self.a.app.copy_code()
+        self.assertEqual(self.a.root.clipboard, self.a.app.code)
+        self.assertTrue(any(w.kw.get("text") == self.a.app.code for w in self.a.root.widgets))
+
     def test_band_select(self):
         A = self.a.app
         self.a.drag([(100, 100), (120, 110)])
@@ -598,6 +618,56 @@ class ClientTest(unittest.TestCase):
         B.open_file()
         self.a.wait(lambda: self.texts(self.a) == ["存起來"] and len(A.strokes) == 2)
         self.b.wait(lambda: len(B.strokes) == 2)
+
+
+class LauncherTest(unittest.TestCase):
+    """start.py 不帶參數時的小視窗：建立房間 / 輸入房間號加入。"""
+
+    def run_launcher(self, action):
+        import start
+        fake_tk.Tk.on_mainloop = action
+        try:
+            return start.launcher_gui()
+        finally:
+            fake_tk.Tk.on_mainloop = None
+
+    @staticmethod
+    def entries(root):
+        return [w for w in root.widgets if isinstance(w, fake_tk.Entry)]
+
+    def test_create(self):
+        def act(root):
+            self.entries(root)[0].kw["textvariable"].set("  amy ")
+            root.button("建立房間").kw["command"]()
+        self.assertEqual(self.run_launcher(act), {"action": "create", "name": "amy"})
+
+    def test_join(self):
+        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", "9189",
+                              "--udp-port", "9190"], cwd=HERE, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (p.terminate(), p.wait()))
+        time.sleep(0.8)
+        seen = {}
+
+        def act(root):
+            code_var = self.entries(root)[1].kw["textvariable"]
+            status = next(w for w in root.widgets if w.kw.get("wraplength"))
+            join = root.button("加入房間").kw["command"]
+            join()
+            seen["empty"] = status.kw["text"]
+            code_var.set("A0?11")
+            join()
+            seen["bad"] = status.kw["text"]
+            code_var.set(client.roomcode.encode("127.0.0.1", 9191))   # 沒有人開
+            join()
+            seen["down"] = status.kw["text"]
+            code_var.set(client.roomcode.encode("127.0.0.1", 9189).lower())
+            join()
+        r = self.run_launcher(act)
+        self.assertEqual(seen["empty"], "請輸入房間號")
+        self.assertIn("無效的字元", seen["bad"])
+        self.assertIn("沒有開伺服器", seen["down"])
+        self.assertEqual(r["action"], "join")
+        self.assertEqual(r["target"][:3], ("127.0.0.1", 9189, "lobby"))
 
 
 if __name__ == "__main__":

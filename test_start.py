@@ -11,6 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
+import roomcode
 import start
 from protocol import encode
 
@@ -38,6 +39,37 @@ class StartTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.p.terminate()
         cls.p.wait()
+
+    def test_join_by_code(self):
+        code = roomcode.encode("127.0.0.1", PORT)
+        ip, port, room, info = start.join_target(code.lower())
+        self.assertEqual((ip, port, room, info["app"]), ("127.0.0.1", PORT, "lobby", "collab-whiteboard"))
+        with self.assertRaises(ValueError):
+            start.join_target("ZZZ")                       # 打錯
+        with self.assertRaises(RuntimeError) as cm:
+            start.join_target(roomcode.encode("127.0.0.1", FREE))
+        self.assertIn("沒有開伺服器", str(cm.exception))
+        out = subprocess.run([sys.executable, "start.py", "join", code, "--check"], cwd=HERE,
+                             capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(f"-> 127.0.0.1:{PORT}", out.stdout)
+        out = subprocess.run([sys.executable, "start.py", "join", "A0?11", "--check"], cwd=HERE,
+                             capture_output=True, text=True, timeout=20)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("無效的字元", out.stderr)
+
+    def test_create_room(self):
+        proc, code = start.create_room(FREE, FREE_UDP, "art")
+        try:
+            ip, port, room = roomcode.decode(code)
+            self.assertEqual((ip, port, room), (start.local_ip(), FREE, "art"))
+            self.assertTrue(start.join_target(code))       # 用房間號連得到 (本機)
+            proc2, code2 = start.create_room(FREE, FREE_UDP, "art")   # 已經開著 -> 沿用
+            self.assertIsNone(proc2)
+            self.assertEqual(code2, code)
+        finally:
+            proc.terminate()
+            proc.wait()
 
     def test_tcp_probe(self):
         info = start.tcp_probe("127.0.0.1", PORT)

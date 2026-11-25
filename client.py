@@ -20,9 +20,10 @@ import zlib
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
+import roomcode
 from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
                       clamp_scale, decode, dump_board, encode, is_text, move_obj,
-                      objects_bbox, parse_board, scale_obj)
+                      local_ip, objects_bbox, parse_board, scale_obj)
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -117,9 +118,19 @@ def text_width_units(line):
     return sum(2 if ord(ch) > 0x2E80 else 1 for ch in line)
 
 
+def room_code_for(host, port, room):
+    """依連線目標算出房間號 (連到本機時用本機的區網 IP)。"""
+    try:
+        ip = local_ip() if host in ("127.0.0.1", "localhost") else socket.gethostbyname(host)
+        return roomcode.encode(ip, port, room)
+    except (OSError, ValueError):
+        return None
+
+
 class App:
-    def __init__(self, root, net, inbox):
+    def __init__(self, root, net, inbox, code=None):
         self.root, self.net, self.inbox = root, net, inbox
+        self.code = code or room_code_for(net.host, net.port, net.room)
         self.my_name = net.name
         self.online = False
         self.users = []
@@ -148,7 +159,7 @@ class App:
 
     # ====================== 介面 ======================
     def build_ui(self):
-        self.root.title("協作白板")
+        self.root.title(f"協作白板 — 房間號 {self.code}" if self.code else "協作白板")
         self.root.geometry("1100x720")
 
         # 第一列：工具、顏色、粗細、字級
@@ -184,6 +195,11 @@ class App:
         for text, cmd in [("復原 Ctrl+Z", self.undo), ("清除畫布", self.clear),
                           ("開啟 Ctrl+O", self.open_file), ("儲存 Ctrl+S", self.save)]:
             tk.Button(bar2, text=text, command=cmd).pack(side=tk.LEFT, padx=1)
+        if self.code:
+            tk.Label(bar2, text="   房間號").pack(side=tk.LEFT)
+            tk.Label(bar2, text=self.code, fg="#1565c0",
+                     font=(self.family, 13, "bold")).pack(side=tk.LEFT, padx=4)
+            tk.Button(bar2, text="複製房間號", command=self.copy_code).pack(side=tk.LEFT)
         self.status = tk.Label(bar2, text="連線中...", fg="#888", anchor="e")
         self.status.pack(side=tk.RIGHT)
 
@@ -249,6 +265,14 @@ class App:
         else:
             self.status.config(text="● 離線，重新連線中...", fg="#c62828")
         self.users_lbl.config(text=f"線上 {len(self.users)} 人: " + ", ".join(self.users))
+
+    def copy_code(self):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.code)
+        except tk.TclError:
+            pass
+        self.flash(f"已複製房間號 {self.code}，傳給其他人即可加入")
 
     def flash(self, text):
         self.status.config(text=text, fg="#1565c0")
@@ -1034,6 +1058,7 @@ def main():
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--name", help="暱稱 (未指定會詢問)")
     ap.add_argument("--room", default="lobby", help="房間名稱 (預設 lobby)")
+    ap.add_argument("--code", help="顯示用的房間號 (start.py 會自動帶入)")
     args = ap.parse_args()
 
     root = tk.Tk()
@@ -1044,7 +1069,7 @@ def main():
         root.deiconify()
     inbox = queue.Queue()
     net = Net(args.host, args.port, name, args.room, inbox)
-    App(root, net, inbox)
+    App(root, net, inbox, code=args.code)
     net.start()
     root.mainloop()
 

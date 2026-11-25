@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""一鍵啟動：自動找到區網裡已經開著的白板伺服器並連線；找不到才在本機開一個。
+"""白板啟動器：建立房間 / 輸入房間號加入。
 
-    python3 start.py                    # 自動尋找 / 自動開伺服器，然後開啟白板
-    python3 start.py --name amy --room design
-    python3 start.py --check            # 只列出找到的伺服器，不開白板
-    python3 start.py --check --host 192.168.1.23   # 診斷連不到某台的原因
-    python3 start.py --subnet 10.10.0.0/22         # 網段不是 /24 時指定要掃描的範圍
+    python3 start.py                     # 跳出小視窗：建立房間，或輸入房間號加入
+    python3 start.py create              # 建立房間 (在本機開伺服器)，顯示房間號
+    python3 start.py join A008Q          # 輸入房間號加入
+    python3 start.py join A008Q --check  # 只檢查連不連得到 (連不到會說明原因)
+    python3 start.py auto                # 舊方式：自動尋找區網裡的伺服器，找不到才自己開
+    (create / join / auto 都可加 --name 暱稱；create 可加 --room 房間名)
 
-尋找順序：
-  1. 本機 (127.0.0.1)
-  2. UDP 廣播 (快，但有些 Wi-Fi 會擋)
-  3. TCP 掃描本機每張網卡所在的網段 (預設 /24，廣播被擋時的備案)
-找不到 -> 隨機等一下再找一次 (避免兩台同時啟動各開一個伺服器) -> 在本機開伺服器。
+房間號是把開房那台的 IP 編碼而成 (見 roomcode.py)，加入的人解碼後直接連線，
+不需要廣播或掃描，所以在會擋廣播的學校 / 公司網路也能用。
 
 自己開的伺服器：關閉白板視窗時，如果還有其他人在使用，伺服器會繼續執行，
 等所有人都離開才自動關閉 (也可以按 Ctrl+C 強制關閉)。
+
+auto 模式的尋找順序：本機 -> UDP 廣播 -> TCP 掃描本機每張網卡所在的網段 (預設 /24)；
+找不到 -> 隨機等一下再找一次 (避免兩台同時啟動各開一個伺服器) -> 在本機開伺服器。
 """
 import argparse
+import getpass
 import ipaddress
 import json
 import random
@@ -27,6 +29,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import roomcode
 from protocol import APP_ID, DEFAULT_PORT, DISCOVER_MAGIC, DISCOVERY_PORT, encode, local_ip
 
 HERE = Path(__file__).resolve().parent
@@ -204,8 +207,170 @@ def wait_until_empty(proc, port):
     print("伺服器已關閉")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="自動連線 / 自動開伺服器的白板啟動器")
+def run_client(host, port, room, name=None, code=None):
+    cmd = [sys.executable, str(HERE / "client.py"), "--host", host, "--port", str(port),
+           "--room", room]
+    if name:
+        cmd += ["--name", name]
+    if code:
+        cmd += ["--code", code]
+    try:
+        subprocess.run(cmd, cwd=HERE)
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------- 建立 / 加入房間 ----------
+def create_room(port=DEFAULT_PORT, udp_port=DISCOVERY_PORT, room=roomcode.DEFAULT_ROOM):
+    """在本機開伺服器 (已經開著就沿用)。回傳 (自己開的伺服器 process 或 None, 房間號)。"""
+    info = tcp_probe("127.0.0.1", port)
+    proc = None
+    if info is None:
+        proc = start_server(port, udp_port)
+    elif info.get("old"):
+        raise RuntimeError("這台已經開著舊版的伺服器，請先關掉它 (Ctrl+C) 再建立房間")
+    return proc, roomcode.encode(local_ip(), port, room)
+
+
+def join_target(code):
+    """解出房間號並確認連得到。回傳 (ip, port, room, 伺服器資訊)；
+    房間號錯誤丟出 ValueError，連不到丟出 RuntimeError (附原因)。"""
+    ip, port, room = roomcode.decode(code)
+    info, why = probe_detail(ip, port, timeout=2)
+    if not info and ip in local_ips():          # 房間就開在自己這台
+        info, why = probe_detail("127.0.0.1", port, timeout=2)
+    if not info:
+        raise RuntimeError(f"連不到房間 {roomcode.encode(ip, port, room)} ({ip})：{why}")
+    return ip, port, room, info
+
+
+def print_code(code, port, room):
+    line = "=" * 44
+    print(f"\n{line}\n  房間已建立！ 房間號：  {code}\n"
+          f"  其他人執行  python3 start.py  並輸入房間號即可加入\n"
+          f"  (或  python3 start.py join {code})\n{line}")
+    others = [ip for ip in local_ips() if ip != local_ip()]
+    if others:                                  # 多張網卡：列出其他網路用的房間號
+        print("  如果對方連不到，可以改用其他網卡的房間號：")
+        for ip in others:
+            print(f"    {roomcode.encode(ip, port, room)}   ({ip})")
+    print()
+
+
+def cmd_create(name, room, port, udp_port):
+    try:
+        proc, code = create_room(port, udp_port, room)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    print_code(code, port, room)
+    run_client("127.0.0.1", port, room, name, code)
+    if proc:
+        wait_until_empty(proc, port)
+
+
+def cmd_join(code, name, check=False):
+    try:
+        ip, port, room, info = join_target(code)
+    except (ValueError, RuntimeError) as e:
+        sys.exit(str(e))
+    norm = roomcode.encode(ip, port, room)
+    if info.get("old"):
+        print("注意：那台的伺服器是舊版，文字框、縮放等新功能不會同步。請那台 git pull 後重開。")
+    print(f"房間 {norm} -> {ip}:{port}  線上 {info.get('users', '?')} 人")
+    if not check:
+        run_client(ip, port, room, name, norm)
+
+
+def launcher_gui():
+    """小視窗：建立房間，或輸入房間號加入。回傳使用者的選擇 (關閉視窗則為空)。"""
+    import tkinter as tk
+    root = tk.Tk()
+    root.title("協作白板")
+    root.resizable(False, False)
+    result = {}
+    f = tk.Frame(root, padx=24, pady=18)
+    f.pack()
+    tk.Label(f, text="協作白板", font=("TkDefaultFont", 18, "bold")).grid(
+        row=0, column=0, columnspan=3, pady=(0, 12))
+    tk.Label(f, text="暱稱").grid(row=1, column=0, sticky="e", padx=(0, 6))
+    try:
+        default_name = getpass.getuser()
+    except Exception:
+        default_name = "guest"
+    name_var = tk.StringVar(value=default_name)
+    tk.Entry(f, textvariable=name_var, width=18).grid(row=1, column=1, columnspan=2, sticky="we")
+    status = tk.Label(f, text="", fg="#c62828", wraplength=300, justify="left")
+
+    def name():
+        return name_var.get().strip() or "guest"
+
+    def on_create():
+        result.update(action="create", name=name())
+        root.destroy()
+
+    def on_join(event=None):
+        code = code_var.get().strip()
+        if not code:
+            status.config(text="請輸入房間號")
+            return
+        status.config(text="連線中...", fg="#555")
+        root.update_idletasks()
+        try:
+            target = join_target(code)
+        except (ValueError, RuntimeError) as e:
+            status.config(text=str(e), fg="#c62828")
+            return
+        result.update(action="join", target=target, name=name())
+        root.destroy()
+
+    tk.Button(f, text="建立房間", width=24, command=on_create).grid(
+        row=2, column=0, columnspan=3, pady=(14, 6))
+    tk.Label(f, text="──────  或  ──────", fg="#999").grid(row=3, column=0, columnspan=3)
+    tk.Label(f, text="房間號").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=(6, 0))
+    code_var = tk.StringVar()
+    entry = tk.Entry(f, textvariable=code_var, width=12, font=("TkFixedFont", 14))
+    entry.grid(row=4, column=1, pady=(6, 0))
+    entry.bind("<Return>", on_join)
+    tk.Button(f, text="加入房間", command=on_join).grid(row=4, column=2, padx=(6, 0), pady=(6, 0))
+    status.grid(row=5, column=0, columnspan=3, pady=(10, 0), sticky="w")
+    entry.focus_set()
+    root.mainloop()
+    return result
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if not argv:                                # 沒有參數：跳出啟動視窗
+        r = launcher_gui()
+        if r.get("action") == "create":
+            cmd_create(r["name"], roomcode.DEFAULT_ROOM, DEFAULT_PORT, DISCOVERY_PORT)
+        elif r.get("action") == "join":
+            ip, port, room, info = r["target"]
+            run_client(ip, port, room, r["name"], roomcode.encode(ip, port, room))
+        return
+    if argv[0] in ("create", "join"):
+        ap = argparse.ArgumentParser(prog="start.py " + argv[0])
+        ap.add_argument("--name", help="暱稱 (未指定會在視窗跳出詢問)")
+        if argv[0] == "create":
+            ap.add_argument("--room", default=roomcode.DEFAULT_ROOM, help="房間名 (預設 lobby)")
+            ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+            ap.add_argument("--udp-port", type=int, default=DISCOVERY_PORT)
+            a = ap.parse_args(argv[1:])
+            cmd_create(a.name, a.room, a.port, a.udp_port)
+        else:
+            ap.add_argument("code", help="房間號，例如 A008Q")
+            ap.add_argument("--check", action="store_true", help="只檢查連不連得到，不開白板")
+            a = ap.parse_args(argv[1:])
+            cmd_join(a.code, a.name, a.check)
+        return
+    if argv[0] == "auto":
+        argv = argv[1:]
+    auto_main(argv)                             # 舊用法 (start.py --check 等) 仍可使用
+
+
+def auto_main(argv):
+    ap = argparse.ArgumentParser(prog="start.py auto",
+                                 description="自動尋找區網裡的伺服器，找不到才自己開")
     ap.add_argument("--name", help="暱稱 (未指定會在視窗跳出詢問)")
     ap.add_argument("--room", default="lobby")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -216,7 +381,7 @@ def main():
     ap.add_argument("--subnet", action="append", default=[],
                     help="要掃描的網段，例如 10.10.0.0/22 (可重複)")
     ap.add_argument("--check", action="store_true", help="只列出找到的伺服器，不開白板")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     try:
         networks = [ipaddress.ip_network(n, strict=False) for n in args.subnet] or None
@@ -274,14 +439,8 @@ def main():
         host = "127.0.0.1"
         print(f"伺服器已啟動！其他電腦執行 python3 start.py 會自動連到這台 ({local_ip()})")
 
-    cmd = [sys.executable, str(HERE / "client.py"), "--host", host, "--port", str(args.port),
-           "--room", args.room]
-    if args.name:
-        cmd += ["--name", args.name]
-    try:
-        subprocess.run(cmd, cwd=HERE)
-    except KeyboardInterrupt:
-        pass
+    run_client(host, args.port, args.room, args.name,
+               roomcode.encode(local_ip() if host == "127.0.0.1" else host, args.port, args.room))
     if server_proc:
         wait_until_empty(server_proc, args.port)
 
