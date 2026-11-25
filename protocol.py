@@ -13,6 +13,7 @@ client -> server
   {"type":"scale",  "sids":[...], "ox", "oy", "sx", "sy"}                   # 以 (ox,oy) 為基準縮放
   {"type":"delete", "sids":[...]}                                           # 刪除物件
   {"type":"cursor", "x", "y"}
+  {"type":"ping"}                      # 探測伺服器 (不需先 hello)，回覆 pong
   {"type":"undo"}                      # 移除自己最後新增的物件
   {"type":"clear"}                     # 清空整個房間畫布
 
@@ -25,13 +26,18 @@ server -> client
   {"type":"scale",     "sids", "ox", "oy", "sx", "sy"}
   {"type":"cursor",    "name", "x", "y"}
   {"type":"remove",    "sid"}          {"type":"clear", "by"}
+  {"type":"pong",      "app", "port", "users", "rooms":{房間: 人數}, "host"}
   {"type":"error",     "text"}
+
+自動探索 (UDP)：客戶端廣播 DISCOVER_MAGIC 到 DISCOVERY_PORT，伺服器回傳一個 pong JSON。
 """
 import json
 import math
 import re
 
 DEFAULT_PORT = 9100
+DISCOVERY_PORT = 9101
+DISCOVER_MAGIC = b"COLLAB_WHITEBOARD_DISCOVER"
 MAX_PTS_PER_MSG = 500          # 單一 draw 訊息最多幾個點
 MAX_TEXT = 1000                # 文字框最多字數
 MIN_FONT, MAX_FONT = 6, 120
@@ -40,6 +46,19 @@ MIN_SCALE, MAX_SCALE = 0.05, 20.0
 FILE_VERSION = 2
 APP_ID = "collab-whiteboard"
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def local_ip():
+    """取得本機在區域網路上的 IP (不會真的送出封包)。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def encode(**obj) -> bytes:

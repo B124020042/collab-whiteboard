@@ -7,13 +7,15 @@
 """
 import argparse
 import asyncio
+import json
 import logging
 import re
+import socket
 from collections import OrderedDict
 
-from protocol import (DEFAULT_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
-                      clamp_move, clamp_scale, decode, encode, is_text, move_obj, scale_obj,
-                      valid_color)
+from protocol import (APP_ID, DEFAULT_PORT, DISCOVER_MAGIC, DISCOVERY_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
+                      clamp_move, clamp_scale, decode, encode, is_text, local_ip, move_obj,
+                      scale_obj, valid_color)
 
 MAX_NAME = 16
 MAX_ROOM = 20
@@ -36,9 +38,29 @@ class Room:
         self.strokes = OrderedDict()       # sid -> stroke dict
 
 
+class Discovery(asyncio.DatagramProtocol):
+    """回應區網內的 UDP 探索廣播，讓 start.py 自動找到這台伺服器。"""
+
+    def __init__(self, srv):
+        self.srv = srv
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        if data.strip() == DISCOVER_MAGIC:
+            self.transport.sendto(json.dumps(self.srv.info(), ensure_ascii=False).encode(), addr)
+
+
 class WhiteboardServer:
-    def __init__(self):
+    def __init__(self, port=DEFAULT_PORT):
         self.rooms = {}
+        self.port = port
+
+    def info(self):
+        return {"type": "pong", "app": APP_ID, "port": self.port, "host": socket.gethostname(),
+                "users": sum(len(r.users) for r in self.rooms.values()),
+                "rooms": {n: len(r.users) for n, r in self.rooms.items() if r.users}}
 
     # ---------- 傳送 ----------
     async def send(self, c, data: bytes):
@@ -85,6 +107,9 @@ class WhiteboardServer:
         t = msg.get("type")
         if t == "hello":
             await self.hello(c, msg)
+            return
+        if t == "ping":
+            await self.send(c, encode(**self.info()))
             return
         if c.room is None:
             await self.send(c, encode(type="error", text="請先送出 hello"))
@@ -221,11 +246,20 @@ async def main():
     ap = argparse.ArgumentParser(description="協作白板伺服器")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap.add_argument("--udp-port", type=int, default=DISCOVERY_PORT, help="自動探索用的 UDP port")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    srv = WhiteboardServer()
+    srv = WhiteboardServer(args.port)
     server = await asyncio.start_server(srv.handle, args.host, args.port, limit=1024 * 1024)
+    try:
+        await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: Discovery(srv), local_addr=(args.host, args.udp_port))
+    except OSError as e:
+        logging.warning("UDP 自動探索無法啟用 (%s)，其他電腦仍可用 --host 手動連線", e)
+    ip = local_ip()
     logging.info("白板伺服器啟動於 %s:%d", args.host, args.port)
+    logging.info("其他電腦可執行: python3 start.py  (自動尋找)  或  "
+                 "python3 client.py --host %s --port %d", ip, args.port)
     async with server:
         await server.serve_forever()
 
