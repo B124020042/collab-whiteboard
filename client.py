@@ -17,7 +17,7 @@ import uuid
 import zlib
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
-from protocol import DEFAULT_PORT, decode, encode
+from protocol import DEFAULT_PORT, chunk_pts, decode, dump_board, encode, parse_board
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -108,6 +108,7 @@ class App:
         self.last_px = None
         self.last_cursor_t = 0.0
         self.resize_job = None
+        self.pending_load = None   # 「清除後載入」：等伺服器確認清除後再載入
         self.build_ui()
         self.root.after(15, self.poll)
         self.root.after(FLUSH_MS, self.flush_timer)
@@ -138,6 +139,7 @@ class App:
         self.eraser_btn.pack(side=tk.LEFT, padx=4)
         tk.Button(bar, text="復原 (Ctrl+Z)", command=self.undo).pack(side=tk.LEFT, padx=2)
         tk.Button(bar, text="清除畫布", command=self.clear).pack(side=tk.LEFT, padx=2)
+        tk.Button(bar, text="開啟", command=self.open_file).pack(side=tk.LEFT, padx=2)
         tk.Button(bar, text="儲存", command=self.save).pack(side=tk.LEFT, padx=2)
 
         self.status = tk.Label(bar, text="連線中...", fg="#888", anchor="e")
@@ -155,6 +157,8 @@ class App:
         self.canvas.bind("<Configure>", self.on_resize)
         self.root.bind("<Control-z>", lambda e: self.undo())
         self.root.bind("<Command-z>", lambda e: self.undo())
+        self.root.bind("<Control-o>", lambda e: self.open_file())
+        self.root.bind("<Control-s>", lambda e: self.save())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.set_color(self.color)
 
@@ -284,18 +288,65 @@ class App:
 
     def save(self):
         path = filedialog.asksaveasfilename(
-            defaultextension=".ps",
-            filetypes=[("PostScript 圖檔", "*.ps"), ("筆跡資料 JSON", "*.json")])
+            defaultextension=".json",
+            filetypes=[("白板檔 (可再開啟)", "*.json"), ("PostScript 圖檔 (僅圖片)", "*.ps")])
         if not path:
             return
-        if path.lower().endswith(".json"):
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(list(self.strokes.values()), f, ensure_ascii=False)
-        else:
-            self.canvas.itemconfigure("cursor", state="hidden")
-            self.canvas.postscript(file=path, colormode="color")
-            self.canvas.itemconfigure("cursor", state="normal")
+        try:
+            if path.lower().endswith(".ps"):
+                self.canvas.itemconfigure("cursor", state="hidden")
+                self.canvas.postscript(file=path, colormode="color")
+                self.canvas.itemconfigure("cursor", state="normal")
+            else:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(dump_board(self.strokes.values()), f, ensure_ascii=False)
+        except OSError as e:
+            messagebox.showerror("儲存失敗", str(e))
+            return
         messagebox.showinfo("儲存", f"已儲存到\n{path}")
+
+    def open_file(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("白板檔", "*.json"), ("所有檔案", "*.*")])
+        if not path:
+            return
+        if path.lower().endswith(".ps"):
+            messagebox.showwarning("無法開啟", ".ps 是圖片格式，無法還原成筆跡。\n"
+                                   "請用「儲存」存成 .json，之後就能用「開啟」讀回來。")
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                strokes = parse_board(json.load(f))
+        except (OSError, ValueError) as e:     # JSONDecodeError 也是 ValueError
+            messagebox.showerror("開啟失敗", f"無法讀取這個檔案:\n{e}")
+            return
+        if not self.online:
+            messagebox.showwarning("開啟", "目前離線，連上伺服器後再試一次。")
+            return
+        ans = messagebox.askyesnocancel(
+            "開啟", f"檔案共有 {len(strokes)} 筆筆跡，會同步給房間內所有人。\n\n"
+                    "是：先清除目前畫布再載入\n否：疊加在目前畫布上")
+        if ans is None:
+            return
+        if ans:
+            self.pending_load = strokes         # 等伺服器廣播 clear 回來再載入，避免被清掉
+            self.net.send(type="clear")
+        else:
+            self.load_strokes(strokes)
+
+    def load_strokes(self, strokes):
+        """把讀進來的筆跡當成自己畫的送給伺服器 (之後也能用復原逐筆撤銷)。"""
+        self.flush()
+        for s in strokes:
+            sid = uuid.uuid4().hex[:12]
+            for chunk in chunk_pts(s["pts"]):
+                self.net.send(type="draw", sid=sid, color=s["color"], width=s["width"],
+                              pts=[[round(x, 4), round(y, 4)] for x, y in chunk])
+            self.strokes[sid] = {"color": s["color"], "width": s["width"],
+                                 "pts": list(s["pts"]), "owner": self.my_name}
+            self.draw_pts(sid, s["color"], s["width"], s["pts"])
+        self.status.config(text=f"已載入 {len(strokes)} 筆筆跡", fg="#1565c0")
+        self.root.after(2000, self.refresh_status)
 
     # ---------- 他人游標 ----------
     def place_cursor(self, name, x, y):
@@ -343,7 +394,7 @@ class App:
         elif t == "welcome":              # (重新)連線 -> 以伺服器的完整狀態為準
             self.my_name = m["name"]
             self.users = m["users"]
-            self.cur_sid, self.pending = None, []
+            self.cur_sid, self.pending, self.pending_load = None, [], None
             self.strokes = {s["sid"]: s for s in m["strokes"]}
             self.redraw_all()
             self.refresh_status()
@@ -363,6 +414,9 @@ class App:
             self.cur_sid = None
             self.status.config(text=f"{m['by']} 清除了畫布", fg="#1565c0")
             self.root.after(2000, self.refresh_status)
+            if self.pending_load is not None and m["by"] == self.my_name:
+                strokes, self.pending_load = self.pending_load, None
+                self.load_strokes(strokes)
         elif t == "cursor":
             self.place_cursor(m["name"], m["x"], m["y"])
         elif t == "user_join":

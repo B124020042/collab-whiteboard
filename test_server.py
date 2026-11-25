@@ -11,7 +11,9 @@ import time
 import unittest
 from pathlib import Path
 
-from protocol import decode, encode
+import json
+
+from protocol import chunk_pts, decode, dump_board, encode, parse_board
 
 HERE = Path(__file__).resolve().parent
 PORT = 9177
@@ -155,6 +157,60 @@ class WhiteboardTest(unittest.TestCase):
         watcher.until("user_leave")
         self.assertEqual(len(C("v", "botroom").welcome["strokes"]), 3)
         watcher.close()
+
+    def test_save_load_roundtrip(self):
+        """模擬：A 畫圖 -> 存成 .json -> 讀檔 -> 用 client 的方式送出 -> B 看到相同畫面。"""
+        a, w = C("artist", "save"), C("watcher", "save")
+        long_line = [[i / 1200, 0.5] for i in range(1200)]          # 超過單訊息上限
+        a.send(type="draw", sid="dot", color="#123456", width=7, pts=[[0.3, 0.3]])
+        for ch in chunk_pts(long_line):
+            a.send(type="draw", sid="long", color="#ff0000", width=2, pts=ch)
+        for _ in range(1 + len(list(chunk_pts(long_line)))):
+            w.until("draw")                                          # 確定伺服器都處理完了
+        original = C("saver", "save").welcome["strokes"]
+        self.assertEqual(len(original), 2)
+        text = json.dumps(dump_board(original))                     # 存檔
+        loaded = parse_board(json.loads(text))                       # 讀檔
+        a.send(type="clear")
+        a.until("clear")
+        viewer = C("viewer", "save")
+        for i, s in enumerate(loaded):                               # 載入 = 重新送出
+            for ch in chunk_pts(s["pts"]):
+                a.send(type="draw", sid=f"new{i}", color=s["color"], width=s["width"], pts=ch)
+        got = [viewer.until("draw") for _ in range(1 + len(list(chunk_pts(long_line))))]
+        self.assertEqual(got[0]["color"], "#123456")
+        restored = C("check", "save").welcome["strokes"]
+        self.assertEqual([(s["color"], s["width"]) for s in restored],
+                         [(s["color"], s["width"]) for s in original])
+        # 去掉分段時重複的接點後，點座標與原本完全相同
+        dedup = [p for i, p in enumerate(restored[1]["pts"])
+                 if i == 0 or p != restored[1]["pts"][i - 1]]
+        self.assertEqual(dedup, long_line)
+        a.close(); w.close(); viewer.close()
+
+
+class FileFormatTest(unittest.TestCase):
+    def test_parse_board(self):
+        data = {"strokes": [{"color": "#00ff00", "width": 4, "pts": [[0.1, 0.2]]},
+                            {"color": "evil", "width": 999, "pts": [[5, -1]]},
+                            {"oops": 1}]}
+        out = parse_board(data)
+        self.assertEqual(out, [{"color": "#00ff00", "width": 4, "pts": [[0.1, 0.2]]},
+                               {"color": "#000000", "width": 60, "pts": [[1.0, 0.0]]}])
+        self.assertEqual(parse_board([]), [])                       # 空白畫布也合法
+        for bad in ({"hello": 1}, "text", [{"x": 1}]):
+            with self.assertRaises(ValueError):
+                parse_board(bad)
+
+    def test_chunk_pts(self):
+        for n in (1, 2, 499, 500, 501, 1200):
+            pts = [[i, i] for i in range(n)]
+            chunks = list(chunk_pts(pts))
+            self.assertTrue(all(len(c) <= 500 for c in chunks))
+            self.assertEqual(chunks[0][0], pts[0])
+            self.assertEqual(chunks[-1][-1], pts[-1])
+            for x, y in zip(chunks, chunks[1:]):
+                self.assertEqual(x[-1], y[0])                        # 段與段相接
 
 
 if __name__ == "__main__":

@@ -11,12 +11,11 @@ import logging
 import re
 from collections import OrderedDict
 
-from protocol import DEFAULT_PORT, decode, encode
+from protocol import DEFAULT_PORT, MAX_PTS_PER_MSG, decode, encode
 
 MAX_NAME = 16
 MAX_ROOM = 20
 MAX_STROKES = 5000          # 每房間筆跡上限，超過就丟掉最舊的
-MAX_PTS_PER_MSG = 500
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
