@@ -58,6 +58,44 @@ class StartTest(unittest.TestCase):
         self.assertIsNone(start.tcp_probe("127.0.0.1", port))
         srv.close()
 
+    def fake_server(self, reply):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0)); srv.listen()
+
+        def run():
+            c, _ = srv.accept()
+            c.recv(100)
+            c.sendall(reply)
+            c.close()
+        threading.Thread(target=run, daemon=True).start()
+        self.addCleanup(srv.close)
+        return srv.getsockname()[1]
+
+    def test_recognizes_old_server(self):
+        """git pull 前開的舊版伺服器 (不認得 ping) 也要認得出來。"""
+        port = self.fake_server(encode(type="error", text="請先送出 hello"))
+        info = start.tcp_probe("127.0.0.1", port)
+        self.assertTrue(info and info["old"])
+
+    def test_diagnose_reasons(self):
+        self.assertIn("拒絕", start.probe_detail("127.0.0.1", FREE)[1])
+        port = self.fake_server(b"SSH-2.0-OpenSSH\r\n")
+        self.assertIn("不是白板", start.probe_detail("127.0.0.1", port)[1])
+        out = subprocess.run([sys.executable, "start.py", "--check", "--host", "127.0.0.1",
+                              "--port", str(FREE)], cwd=HERE, capture_output=True,
+                             text=True, timeout=20)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("沒有開伺服器", out.stdout)
+        out = subprocess.run([sys.executable, "start.py", "--check", "--host", "127.0.0.1",
+                              "--port", str(PORT)], cwd=HERE, capture_output=True,
+                             text=True, timeout=20).stdout
+        self.assertIn(f"找到 127.0.0.1:{PORT}", out)
+
+    def test_subnet_scan(self):
+        found = start.tcp_scan(PORT, [start.ipaddress.ip_network("127.0.0.0/30")])
+        self.assertIn("127.0.0.1", found)
+        self.assertEqual(start.tcp_scan(FREE, [start.ipaddress.ip_network("127.0.0.0/30")]), {})
+
     def test_udp_discover_and_user_count(self):
         s = socket.create_connection(("127.0.0.1", PORT))
         s.sendall(encode(type="hello", name="amy", room="r1"))
