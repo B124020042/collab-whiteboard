@@ -3,6 +3,7 @@
 
     python3 test_start.py
 """
+import os
 import socket
 import subprocess
 import sys
@@ -57,6 +58,22 @@ class StartTest(unittest.TestCase):
                              capture_output=True, text=True, timeout=20)
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("無效的字元", out.stderr)
+
+    def test_code_kind_and_smart_join(self):
+        self.assertEqual(start.code_kind("A008Q"), "lan")
+        self.assertEqual(start.code_kind(" c0m0y8"), "lan")
+        self.assertEqual(start.code_kind("0P1XD"), "online")
+        self.assertEqual(start.code_kind("K7Q2M"), "online")
+        with self.assertRaises(RuntimeError) as cm:
+            start.smart_join(None, "0P1XD")                    # 這台沒設定線上伺服器
+        self.assertIn("git pull", str(cm.exception))
+        kind, value = start.smart_join(None, roomcode.encode("127.0.0.1", PORT))
+        self.assertEqual((kind, value[:2]), ("lan", ("127.0.0.1", PORT)))
+        out = subprocess.run([sys.executable, "start.py", "join", "0P1XD", "--check"], cwd=HERE,
+                             capture_output=True, text=True, timeout=20,
+                             env=dict(os.environ, WHITEBOARD_SERVER=""))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("還沒設定線上伺服器", out.stderr)
 
     def test_create_room(self):
         proc, code = start.create_room(FREE, FREE_UDP, "art")

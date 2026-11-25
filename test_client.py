@@ -776,6 +776,23 @@ class LauncherTest(unittest.TestCase):
         finally:
             fake_tk.Tk.on_mainloop = None
         self.assertIn("找不到房間", seen["missing"])
+        self.assertNotIn(code[0], "ABCD")                      # 線上房間號不會跟區網的混淆
+
+        # 沒有設定線上伺服器的電腦輸入線上房間號 -> 提示要 git pull 設定
+        def no_server(root):
+            self.entries(root)[1].kw["textvariable"].set(code)
+            root.button("加入房間").kw["command"]()
+            status = next(w for w in root.widgets if w.kw.get("wraplength"))
+            root.pump(lambda: not status.kw["text"].startswith("連線中"))
+            seen["hint"] = status.kw["text"]
+            root.destroyed = True
+        fake_tk.Tk.on_mainloop = no_server
+        try:
+            start.launcher_gui(None)
+        finally:
+            fake_tk.Tk.on_mainloop = None
+        self.assertIn("還沒設定線上伺服器", seen["hint"])
+        self.assertIn("git pull", seen["hint"])
         self.assertEqual(r, {"action": "online", "code": code, "name": r["name"]})
 
         # 兩個客戶端用 WebSocket 連進同一個房間協作
