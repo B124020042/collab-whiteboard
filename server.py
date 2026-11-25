@@ -3,7 +3,7 @@
 
 - 每個房間各自保存筆跡，新加入者會收到完整重播
 - 收到的筆跡依伺服器接收順序轉發給同房間其他人 (伺服器順序即為最終順序)
-- 復原只會移除「自己」最後一筆
+- 物件有筆跡與文字兩種；任何人都能移動 / 刪除 / 編輯文字，復原只會移除「自己」最後新增的物件
 """
 import argparse
 import asyncio
@@ -11,12 +11,13 @@ import logging
 import re
 from collections import OrderedDict
 
-from protocol import DEFAULT_PORT, MAX_PTS_PER_MSG, decode, encode
+from protocol import (DEFAULT_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
+                      clamp_move, decode, encode, is_text, move_obj, valid_color)
 
 MAX_NAME = 16
 MAX_ROOM = 20
-MAX_STROKES = 5000          # 每房間筆跡上限，超過就丟掉最舊的
-COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+MAX_STROKES = 5000          # 每房間物件上限，超過就丟掉最舊的
+MAX_SIDS_PER_MSG = MAX_STROKES
 
 
 class Client:
@@ -32,10 +33,6 @@ class Room:
         self.name = name
         self.users = {}                    # name -> Client
         self.strokes = OrderedDict()       # sid -> stroke dict
-
-
-def clamp01(v):
-    return min(1.0, max(0.0, float(v)))
 
 
 class WhiteboardServer:
@@ -94,6 +91,23 @@ class WhiteboardServer:
         room = self.rooms[c.room]
         if t == "draw":
             await self.draw(c, room, msg)
+        elif t == "text":
+            await self.text(c, room, msg)
+        elif t == "delete":
+            removed = [sid for sid in self.sid_list(msg) if room.strokes.pop(sid, None)]
+            for sid in removed:
+                await self.broadcast(room, type="remove", sid=sid)
+        elif t == "move":
+            sids = [sid for sid in self.sid_list(msg) if sid in room.strokes]
+            try:
+                objs = [room.strokes[sid] for sid in sids]
+                dx, dy = clamp_move(objs, msg["dx"], msg["dy"])
+            except (KeyError, TypeError, ValueError):
+                return
+            if sids and (dx or dy):
+                for o in objs:
+                    move_obj(o, dx, dy)
+                await self.broadcast(room, exclude=c, type="move", sids=sids, dx=dx, dy=dy)
         elif t == "cursor":
             try:
                 x, y = clamp01(msg["x"]), clamp01(msg["y"])
@@ -130,9 +144,7 @@ class WhiteboardServer:
     async def draw(self, c, room, msg):
         try:
             sid = str(msg["sid"])[:40]
-            color = msg.get("color", "#000000")
-            if not COLOR_RE.match(color):
-                color = "#000000"
+            color = valid_color(msg.get("color"))
             width = int(min(60, max(1, int(msg.get("width", 3)))))
             pts = [[clamp01(p[0]), clamp01(p[1])] for p in msg["pts"][:MAX_PTS_PER_MSG]]
         except (KeyError, TypeError, ValueError, IndexError):
@@ -144,11 +156,40 @@ class WhiteboardServer:
             s = room.strokes[sid] = dict(sid=sid, owner=c.name, color=color, width=width, pts=[])
             while len(room.strokes) > MAX_STROKES:
                 room.strokes.popitem(last=False)
-        elif s["owner"] != c.name:
+        elif is_text(s) or s["owner"] != c.name:
             return                          # 不能接續別人的筆跡
         s["pts"].extend(pts)
         await self.broadcast(room, exclude=c, type="draw", sid=sid, owner=c.name,
                              color=s["color"], width=s["width"], pts=pts)
+
+    @staticmethod
+    def sid_list(msg):
+        sids = msg.get("sids")
+        if not isinstance(sids, list):
+            return []
+        return list(dict.fromkeys(str(x)[:40] for x in sids[:MAX_SIDS_PER_MSG]))
+
+    async def text(self, c, room, msg):
+        """新增文字框；sid 已存在時代表修改文字內容 / 顏色 / 字級 (位置以伺服器為準)。"""
+        try:
+            sid = str(msg["sid"])[:40]
+            text = str(msg.get("text", ""))[:MAX_TEXT]
+            size = min(MAX_FONT, max(MIN_FONT, int(msg.get("size", 20))))
+            x, y = clamp01(msg["x"]), clamp01(msg["y"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if not text.strip():
+            return
+        color = valid_color(msg.get("color"))
+        s = room.strokes.get(sid)
+        if s is None:
+            s = room.strokes[sid] = dict(sid=sid, owner=c.name, kind="text", x=x, y=y)
+            while len(room.strokes) > MAX_STROKES:
+                room.strokes.popitem(last=False)
+        elif not is_text(s):
+            return                          # 不能把筆跡改成文字
+        s.update(text=text, color=color, size=size)
+        await self.broadcast(room, exclude=c, type="text", **s)
 
     async def leave(self, c):
         if c.room is None:

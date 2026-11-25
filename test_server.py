@@ -13,7 +13,8 @@ from pathlib import Path
 
 import json
 
-from protocol import chunk_pts, decode, dump_board, encode, parse_board
+from protocol import (chunk_pts, clamp_move, decode, dump_board, encode, move_obj, objects_bbox,
+                      parse_board)
 
 HERE = Path(__file__).resolve().parent
 PORT = 9177
@@ -188,6 +189,37 @@ class WhiteboardTest(unittest.TestCase):
         self.assertEqual(dedup, long_line)
         a.close(); w.close(); viewer.close()
 
+    def test_text_move_delete(self):
+        a, b = C("amy", "objs"), C("ben", "objs")
+        a.send(type="text", sid="t1", x=0.5, y=0.5, text="哈囉", color="#ff0000", size=30)
+        m = b.until("text")
+        self.assertEqual((m["text"], m["owner"], m["kind"], m["size"]), ("哈囉", "amy", "text", 30))
+        b.send(type="text", sid="t1", x=0.9, y=0.9, text="改", color="#00ff00", size=999)
+        m = a.until("text")                                 # 別人也能編輯文字
+        self.assertEqual((m["text"], m["x"], m["size"], m["owner"]), ("改", 0.5, 120, "amy"))
+        b.send(type="text", sid="t2", x=0.1, y=0.1, text="   ")   # 空白文字被拒絕
+        a.send(type="draw", sid="s1", pts=[[0.1, 0.1], [0.3, 0.2]])
+        b.until("draw")
+        a.send(type="text", sid="s1", x=0, y=0, text="把筆跡改成文字")  # 不允許
+        b.send(type="draw", sid="t1", pts=[[0.2, 0.2]])                 # 不允許
+        b.send(type="move", sids=["s1", "t1", "nope"], dx=0.6, dy=-5)
+        m = a.until("move")
+        self.assertEqual(m["sids"], ["s1", "t1"])
+        self.assertAlmostEqual(m["dx"], 0.5)                # 文字 x=0.5 -> 最多右移 0.5
+        self.assertAlmostEqual(m["dy"], -0.1)               # 筆跡 y 最小 0.1 -> 最多上移 0.1
+        b.send(type="delete", sids=["t1", "t1", "ghost"])
+        self.assertEqual(a.until("remove")["sid"], "t1")
+        state = {o["sid"]: o for o in C("v", "objs").welcome["strokes"]}
+        self.assertEqual(list(state), ["s1"])
+        self.assertAlmostEqual(state["s1"]["pts"][0][0], 0.6)
+        self.assertAlmostEqual(state["s1"]["pts"][0][1], 0.0)
+        a.send(type="undo")                                 # 復原也適用文字
+        a.send(type="text", sid="t3", x=0.2, y=0.2, text="最後", color="#000000", size=12)
+        b.until("text")
+        a.send(type="undo")
+        self.assertEqual(b.until("remove")["sid"], "t3")
+        a.close(); b.close()
+
 
 class FileFormatTest(unittest.TestCase):
     def test_parse_board(self):
@@ -201,6 +233,22 @@ class FileFormatTest(unittest.TestCase):
         for bad in ({"hello": 1}, "text", [{"x": 1}]):
             with self.assertRaises(ValueError):
                 parse_board(bad)
+
+    def test_text_objects_and_move(self):
+        board = {"strokes": [{"kind": "text", "x": 2, "y": 0.5, "text": "嗨", "size": 1},
+                             {"kind": "text", "x": 0.1, "y": 0.1, "text": "  "},
+                             {"color": "#111111", "width": 2, "pts": [[0.2, 0.3], [0.4, 0.9]]}]}
+        objs = parse_board(json.loads(json.dumps(dump_board(parse_board(board)))))
+        self.assertEqual(objs[0], {"kind": "text", "x": 1.0, "y": 0.5, "text": "嗨",
+                                   "color": "#000000", "size": 6})
+        self.assertEqual(len(objs), 2)
+        self.assertEqual(objects_bbox(objs), (0.2, 0.3, 1.0, 0.9))
+        dx, dy = clamp_move(objs, -0.5, 0.5)
+        self.assertAlmostEqual(dx, -0.2); self.assertAlmostEqual(dy, 0.1)
+        for o in objs:
+            move_obj(o, dx, dy)
+        self.assertAlmostEqual(objs[0]["x"], 0.8)
+        self.assertAlmostEqual(objs[1]["pts"][1][1], 1.0)
 
     def test_chunk_pts(self):
         for n in (1, 2, 499, 500, 501, 1200):

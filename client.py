@@ -5,6 +5,8 @@
   - 網路執行緒 (Net)：負責連線、自動重連、讀取伺服器訊息 -> 放進 queue
   - 主執行緒 (tkinter)：每 15ms 從 queue 取訊息更新畫面 (tkinter 只能在主執行緒操作)
 效能：滑鼠拖曳時先在本機畫出，點座標累積起來每 30ms 批次送出一次。
+
+工具：畫筆 / 橡皮擦 / 文字 / 選取 (移動、複製、剪下、貼上、刪除)
 """
 import argparse
 import json
@@ -16,8 +18,10 @@ import tkinter as tk
 import uuid
 import zlib
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 
-from protocol import DEFAULT_PORT, chunk_pts, decode, dump_board, encode, parse_board
+from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
+                      decode, dump_board, encode, is_text, move_obj, parse_board)
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -92,34 +96,63 @@ def user_color(name):
 
 
 # ====================== GUI ======================
+TOOLS = [("pen", "畫筆 (P)", "crosshair"), ("eraser", "橡皮擦 (E)", "circle"),
+         ("text", "文字 (T)", "xterm"), ("select", "選取 (V)", "arrow")]
+SEL_COLOR = "#1e88e5"
+PASTE_OFFSET = 0.02
+
+
+def new_sid():
+    return uuid.uuid4().hex[:12]
+
+
+def text_width_units(line):
+    """估算一行文字的寬度 (中日韓全形字約佔兩個字元寬)。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in line)
+
+
 class App:
     def __init__(self, root, net, inbox):
         self.root, self.net, self.inbox = root, net, inbox
         self.my_name = net.name
         self.online = False
         self.users = []
-        self.strokes = {}          # sid -> {"color","width","pts","owner"}
+        self.strokes = {}          # sid -> 物件 (筆跡或文字，見 protocol.py)
         self.cursors = {}          # name -> [dot_id, text_id, x, y]
         self.color = PALETTE[0]
-        self.eraser = False
-        self.cur_sid = None
+        self.tool = "pen"
+        self.cur_sid = None        # 正在畫的筆跡
         self.pending = []          # 尚未送出的點
         self.last_sent = None      # 上一批最後一點 (讓批次之間線條連續)
         self.last_px = None
         self.last_cursor_t = 0.0
+        self.mouse = (0.1, 0.1)    # 最後的滑鼠位置 (比例座標)，貼上純文字時使用
         self.resize_job = None
         self.pending_load = None   # 「清除後載入」：等伺服器確認清除後再載入
+        self.selection = set()     # 已選取的 sid
+        self.drag = None           # 選取工具的拖曳狀態 (移動 / 框選)
+        self.editor = None         # 文字編輯框狀態
+        self.clip = None           # 內部剪貼簿 (系統剪貼簿無法使用時的備援)
+        self.paste_count = 0
+        self.family = tkfont.nametofont("TkDefaultFont").actual("family")
         self.build_ui()
         self.root.after(15, self.poll)
         self.root.after(FLUSH_MS, self.flush_timer)
 
-    # ---------- 介面 ----------
+    # ====================== 介面 ======================
     def build_ui(self):
         self.root.title("協作白板")
-        self.root.geometry("1000x680")
-        bar = tk.Frame(self.root, padx=6, pady=4)
-        bar.pack(side=tk.TOP, fill=tk.X)
+        self.root.geometry("1100x720")
 
+        # 第一列：工具、顏色、粗細、字級
+        bar = tk.Frame(self.root, padx=6, pady=3)
+        bar.pack(side=tk.TOP, fill=tk.X)
+        self.tool_btns = {}
+        for key, label, _ in TOOLS:
+            b = tk.Button(bar, text=label, width=9, command=lambda k=key: self.set_tool(k))
+            b.pack(side=tk.LEFT, padx=1)
+            self.tool_btns[key] = b
+        tk.Frame(bar, width=12).pack(side=tk.LEFT)
         self.swatches = []
         for c in PALETTE:
             sw = tk.Label(bar, bg=c, width=2, height=1, relief=tk.RAISED, bd=2)
@@ -129,38 +162,66 @@ class App:
         tk.Button(bar, text="自訂色", command=self.pick_color).pack(side=tk.LEFT, padx=4)
         self.cur_swatch = tk.Label(bar, bg=self.color, width=3, relief=tk.SUNKEN, bd=2)
         self.cur_swatch.pack(side=tk.LEFT, padx=2)
-
         tk.Label(bar, text="粗細").pack(side=tk.LEFT, padx=(10, 0))
         self.width_var = tk.IntVar(value=4)
         tk.Scale(bar, from_=1, to=40, orient=tk.HORIZONTAL, variable=self.width_var,
-                 length=110, showvalue=True).pack(side=tk.LEFT)
+                 length=100, showvalue=True).pack(side=tk.LEFT)
+        tk.Label(bar, text="字級").pack(side=tk.LEFT, padx=(10, 0))
+        self.font_var = tk.StringVar(value="20")
+        tk.Spinbox(bar, from_=MIN_FONT, to=MAX_FONT, increment=2, width=4,
+                   textvariable=self.font_var).pack(side=tk.LEFT)
 
-        self.eraser_btn = tk.Button(bar, text="橡皮擦", command=self.toggle_eraser)
-        self.eraser_btn.pack(side=tk.LEFT, padx=4)
-        tk.Button(bar, text="復原 (Ctrl+Z)", command=self.undo).pack(side=tk.LEFT, padx=2)
-        tk.Button(bar, text="清除畫布", command=self.clear).pack(side=tk.LEFT, padx=2)
-        tk.Button(bar, text="開啟", command=self.open_file).pack(side=tk.LEFT, padx=2)
-        tk.Button(bar, text="儲存", command=self.save).pack(side=tk.LEFT, padx=2)
-
-        self.status = tk.Label(bar, text="連線中...", fg="#888", anchor="e")
+        # 第二列：編輯動作與檔案
+        bar2 = tk.Frame(self.root, padx=6, pady=2)
+        bar2.pack(side=tk.TOP, fill=tk.X)
+        for text, cmd in [("復原 Ctrl+Z", self.undo), ("複製 Ctrl+C", self.copy),
+                          ("剪下 Ctrl+X", self.cut), ("貼上 Ctrl+V", self.paste),
+                          ("刪除 Del", self.delete_selection), ("全選 Ctrl+A", self.select_all),
+                          ("清除畫布", self.clear), ("開啟 Ctrl+O", self.open_file),
+                          ("儲存 Ctrl+S", self.save)]:
+            tk.Button(bar2, text=text, command=cmd).pack(side=tk.LEFT, padx=1)
+        self.status = tk.Label(bar2, text="連線中...", fg="#888", anchor="e")
         self.status.pack(side=tk.RIGHT)
 
         self.users_lbl = tk.Label(self.root, text="", anchor="w", fg="#555", padx=8)
         self.users_lbl.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, cursor="crosshair")
+        self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, takefocus=1)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Double-Button-1>", self.on_double)
         self.canvas.bind("<Motion>", self.on_move)
         self.canvas.bind("<Configure>", self.on_resize)
-        self.root.bind("<Control-z>", lambda e: self.undo())
-        self.root.bind("<Command-z>", lambda e: self.undo())
-        self.root.bind("<Control-o>", lambda e: self.open_file())
-        self.root.bind("<Control-s>", lambda e: self.save())
+
+        # 快捷鍵 (Windows/Linux 用 Ctrl，macOS 另外綁 Command)
+        for key, fn in [("z", self.undo), ("c", self.copy), ("x", self.cut), ("v", self.paste),
+                        ("a", self.select_all), ("s", self.save), ("o", self.open_file)]:
+            for mod in ("Control", "Command"):
+                for k in (key, key.upper()):
+                    try:
+                        self.root.bind(f"<{mod}-{k}>", self.shortcut(fn))
+                    except tk.TclError:
+                        pass            # 此平台沒有 Command 鍵
+        for k in ("<Delete>", "<BackSpace>"):
+            self.root.bind(k, self.shortcut(self.delete_selection))
+        self.root.bind("<Escape>", self.shortcut(lambda: self.set_selection(())))
+        for key, tool in [("p", "pen"), ("e", "eraser"), ("t", "text"), ("v", "select")]:
+            self.root.bind(f"<KeyPress-{key}>", self.shortcut(lambda t=tool: self.set_tool(t)))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.set_color(self.color)
+        self.set_tool("pen")
+        self.canvas.focus_set()
+
+    def shortcut(self, fn):
+        """快捷鍵包裝：正在輸入文字 (文字框、字級欄位) 時交給輸入框自己處理。"""
+        def handler(e):
+            if self.editor or isinstance(self.root.focus_get(), (tk.Entry, tk.Spinbox, tk.Text)):
+                return None
+            fn()
+            return "break"
+        return handler
 
     def refresh_status(self):
         if self.online:
@@ -169,24 +230,40 @@ class App:
             self.status.config(text="● 離線，重新連線中...", fg="#c62828")
         self.users_lbl.config(text=f"線上 {len(self.users)} 人: " + ", ".join(self.users))
 
+    def flash(self, text):
+        self.status.config(text=text, fg="#1565c0")
+        self.root.after(2000, self.refresh_status)
+
+    def set_tool(self, tool):
+        self.commit_editor()
+        if tool != "select":
+            self.set_selection(())
+        self.tool = tool
+        for key, _, cursor in TOOLS:
+            self.tool_btns[key].config(relief=tk.SUNKEN if key == tool else tk.RAISED)
+            if key == tool:
+                self.canvas.config(cursor=cursor)
+
     def set_color(self, c):
         self.color = c
-        self.eraser = False
-        self.eraser_btn.config(relief=tk.RAISED)
         self.cur_swatch.config(bg=c)
         for col, sw in self.swatches:
             sw.config(relief=tk.SUNKEN if col == c else tk.RAISED)
+        if self.tool == "eraser":
+            self.set_tool("pen")
 
     def pick_color(self):
         c = colorchooser.askcolor(color=self.color, title="選擇顏色")[1]
         if c:
             self.set_color(c.lower())
 
-    def toggle_eraser(self):
-        self.eraser = not self.eraser
-        self.eraser_btn.config(relief=tk.SUNKEN if self.eraser else tk.RAISED)
+    def font_size(self):
+        try:
+            return min(MAX_FONT, max(MIN_FONT, int(self.font_var.get())))
+        except (ValueError, tk.TclError):
+            return 20
 
-    # ---------- 座標轉換 ----------
+    # ====================== 座標轉換 ======================
     def size(self):
         return max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
 
@@ -198,7 +275,7 @@ class App:
         w, h = self.size()
         return p[0] * w, p[1] * h
 
-    # ---------- 繪製 ----------
+    # ====================== 繪製 ======================
     def draw_pts(self, sid, color, width, pts):
         tag = "s_" + sid               # 加前綴，避免全數字 tag 被當成 item id
         coords = []
@@ -214,28 +291,337 @@ class App:
                                     joinstyle=tk.ROUND, smooth=False, tags=(tag, "stroke"))
         self.canvas.tag_raise("cursor")
 
+    def draw_obj(self, sid, o):
+        if is_text(o):
+            px, py = self.to_px((o["x"], o["y"]))
+            self.canvas.create_text(px, py, text=o["text"], fill=o["color"], anchor="nw",
+                                    font=(self.family, o["size"]), tags=("s_" + sid, "stroke"))
+            self.canvas.tag_raise("cursor")
+        else:
+            self.draw_pts(sid, o["color"], o["width"], o["pts"])
+
+    def redraw_obj(self, sid):
+        self.canvas.delete("s_" + sid)
+        if sid in self.strokes:
+            self.draw_obj(sid, self.strokes[sid])
+            if self.editor and self.editor["sid"] == sid:
+                self.canvas.itemconfigure("s_" + sid, state="hidden")
+
     def redraw_all(self):
         self.canvas.delete("stroke")
-        for sid, s in self.strokes.items():
-            self.draw_pts(sid, s["color"], s["width"], s["pts"])
+        for sid, o in self.strokes.items():
+            self.draw_obj(sid, o)
         for name, cur in self.cursors.items():
             self.place_cursor(name, cur[2], cur[3])
+        if self.editor:
+            if self.editor["sid"]:
+                self.canvas.itemconfigure("s_" + self.editor["sid"], state="hidden")
+            self.canvas.coords(self.editor["item"], *self.to_px(self.editor["pos"]))
+        self.refresh_sel()
 
-    # ---------- 滑鼠事件 ----------
+    # ====================== 選取 ======================
+    def hit(self, x, y, text_only=False):
+        """回傳滑鼠位置最上層的物件 sid。"""
+        for item in reversed(self.canvas.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("s_"):
+                    o = self.strokes.get(tag[2:])
+                    if o and (not text_only or is_text(o)):
+                        return tag[2:]
+        return None
+
+    def set_selection(self, sids):
+        self.selection = {s for s in sids if s in self.strokes}
+        self.refresh_sel()
+
+    def refresh_sel(self):
+        self.canvas.delete("selbox")
+        for sid in self.selection:
+            bb = self.canvas.bbox("s_" + sid)
+            if bb:
+                x0, y0, x1, y1 = bb
+                self.canvas.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline=SEL_COLOR,
+                                             dash=(4, 3), tags=("selbox",))
+        self.canvas.tag_raise("cursor")
+
+    def ordered(self, sids):
+        """依畫布上的先後順序 (下層到上層) 排列。"""
+        return [s for s in self.strokes if s in sids]
+
+    def select_all(self):
+        self.set_tool("select")
+        self.set_selection(self.strokes.keys())
+        self.flash(f"已選取 {len(self.selection)} 個物件")
+
+    def delete_sids(self, sids):
+        sids = [s for s in sids if s in self.strokes]
+        if not sids:
+            return
+        for s in sids:
+            self.strokes.pop(s, None)
+            self.canvas.delete("s_" + s)
+            self.selection.discard(s)
+        self.net.send(type="delete", sids=sids)
+        self.refresh_sel()
+
+    def delete_selection(self):
+        if not self.selection:
+            self.flash("沒有選取任何物件 (先用「選取」工具點選或框選)")
+            return
+        n = len(self.selection)
+        self.delete_sids(self.ordered(self.selection))
+        self.flash(f"已刪除 {n} 個物件")
+
+    # ====================== 複製 / 剪下 / 貼上 ======================
+    def copy(self):
+        objs = [self.strokes[s] for s in self.ordered(self.selection)]
+        if not objs:
+            self.flash("沒有選取任何物件 (先用「選取」工具點選或框選)")
+            return False
+        data = dump_board(objs)
+        self.clip = json.loads(json.dumps(data))
+        self.paste_count = 0
+        try:                                # 放進系統剪貼簿，可貼到另一個視窗 / 另一台電腦的白板
+            self.root.clipboard_clear()
+            self.root.clipboard_append(json.dumps(data, ensure_ascii=False))
+        except tk.TclError:
+            pass
+        self.flash(f"已複製 {len(objs)} 個物件")
+        return True
+
+    def cut(self):
+        if self.copy():
+            n = len(self.selection)
+            self.delete_sids(self.ordered(self.selection))
+            self.flash(f"已剪下 {n} 個物件")
+
+    def paste(self):
+        try:
+            txt = self.root.clipboard_get()
+        except tk.TclError:
+            txt = None
+        objs, offset = None, True
+        if txt:
+            try:
+                data = json.loads(txt)
+                if isinstance(data, dict) and data.get("app") == APP_ID:
+                    objs = parse_board(data)          # 白板物件
+            except ValueError:
+                pass
+            if objs is None and txt.strip():          # 一般文字 -> 在滑鼠位置建立文字框
+                objs = [{"kind": "text", "x": self.mouse[0], "y": self.mouse[1],
+                         "text": txt.rstrip()[:MAX_TEXT], "color": self.color,
+                         "size": self.font_size()}]
+                offset = False
+        elif self.clip:
+            objs = parse_board(self.clip)
+        if not objs:
+            self.flash("剪貼簿是空的")
+            return
+        if offset:                                    # 每次貼上都往右下偏移一點，避免完全重疊
+            self.paste_count += 1
+            d = PASTE_OFFSET * self.paste_count
+            dx, dy = clamp_move(objs, d, d)
+            for o in objs:
+                move_obj(o, dx, dy)
+        sids = self.add_objects(objs)
+        self.set_tool("select")
+        self.set_selection(sids)
+        self.flash(f"已貼上 {len(sids)} 個物件")
+
+    def add_objects(self, objs):
+        """把物件當成自己新增的送給伺服器 (貼上 / 開啟檔案共用；之後可用復原撤銷)。"""
+        self.flush()
+        sids = []
+        for o in objs:
+            sid = new_sid()
+            if is_text(o):
+                obj = {"kind": "text", "x": round(o["x"], 4), "y": round(o["y"], 4),
+                       "text": o["text"], "color": o["color"], "size": o["size"]}
+                self.net.send(type="text", sid=sid, **obj)
+            else:
+                pts = [[round(x, 4), round(y, 4)] for x, y in o["pts"]]
+                obj = {"color": o["color"], "width": o["width"], "pts": pts}
+                for chunk in chunk_pts(pts):
+                    self.net.send(type="draw", sid=sid, color=obj["color"],
+                                  width=obj["width"], pts=chunk)
+            obj["owner"] = self.my_name
+            self.strokes[sid] = obj
+            self.draw_obj(sid, obj)
+            sids.append(sid)
+        return sids
+
+    # ====================== 文字編輯框 ======================
+    def open_editor(self, sid=None, px=None, py=None):
+        self.commit_editor()
+        if sid:
+            o = self.strokes[sid]
+            pos, text, color, size = [o["x"], o["y"]], o["text"], o["color"], o["size"]
+            self.canvas.itemconfigure("s_" + sid, state="hidden")
+        else:
+            pos, text, color, size = self.to_norm(px, py), "", self.color, self.font_size()
+        w = tk.Text(self.canvas, font=(self.family, size), fg=color, bg="#fffde7",
+                    insertbackground=color, wrap="none", undo=True, bd=1, relief=tk.SOLID,
+                    highlightthickness=1, highlightcolor=SEL_COLOR, padx=0, pady=0)
+        w.insert("1.0", text)
+        w.bind("<Return>", lambda e: (self.commit_editor(), "break")[1])   # Enter = 完成
+        w.bind("<Shift-Return>", lambda e: None)                          # Shift+Enter = 換行
+        w.bind("<Escape>", lambda e: (self.commit_editor(cancel=True), "break")[1])
+        w.bind("<FocusOut>", lambda e: self.commit_editor())
+        w.bind("<KeyRelease>", lambda e: self.autosize_editor())
+        item = self.canvas.create_window(*self.to_px(pos), window=w, anchor="nw",
+                                         tags=("editor",))
+        self.editor = {"w": w, "item": item, "sid": sid, "pos": pos,
+                       "color": color, "size": size}
+        self.autosize_editor()
+        w.focus_set()
+        w.mark_set("insert", "end-1c")
+
+    def autosize_editor(self):
+        if not self.editor:
+            return
+        w = self.editor["w"]
+        lines = w.get("1.0", "end-1c").split("\n")
+        w.config(width=max(8, max(text_width_units(l) for l in lines) + 2), height=len(lines))
+
+    def commit_editor(self, cancel=False):
+        ed, self.editor = self.editor, None
+        if not ed:
+            return
+        text = ed["w"].get("1.0", "end-1c").rstrip()
+        self.canvas.delete(ed["item"])
+        ed["w"].destroy()
+        sid = ed["sid"]
+        if sid:
+            self.canvas.itemconfigure("s_" + sid, state="normal")
+        self.canvas.focus_set()
+        if cancel:
+            return
+        text = text[:MAX_TEXT]
+        if sid and sid in self.strokes:               # 修改既有文字
+            o = self.strokes[sid]
+            if not text.strip():
+                self.delete_sids([sid])               # 內容清空 = 刪除
+            elif text != o["text"]:
+                o["text"] = text
+                self.net.send(type="text", sid=sid, x=o["x"], y=o["y"], text=text,
+                              color=o["color"], size=o["size"])
+                self.redraw_obj(sid)
+        elif not sid and text.strip():                # 新文字框
+            self.add_objects([{"kind": "text", "x": ed["pos"][0], "y": ed["pos"][1],
+                               "text": text, "color": ed["color"], "size": ed["size"]}])
+        self.refresh_sel()
+
+    # ====================== 滑鼠事件 ======================
     def on_press(self, e):
-        self.cur_sid = uuid.uuid4().hex[:12]
+        self.canvas.focus_set()
+        if self.editor:                    # 點畫布其他地方 = 完成目前的文字
+            self.commit_editor()
+            return
+        if self.tool in ("pen", "eraser"):
+            self.start_stroke(e)
+        elif self.tool == "text":
+            sid = self.hit(e.x, e.y, text_only=True)
+            self.open_editor(sid=sid) if sid else self.open_editor(px=e.x, py=e.y)
+        elif self.tool == "select":
+            sid = self.hit(e.x, e.y)
+            shift = bool(e.state & 0x0001)
+            if sid and shift:              # Shift+點擊：加選 / 取消選取
+                self.set_selection(self.selection ^ {sid})
+                return
+            if sid:                        # 點到物件：選取並準備拖曳移動
+                if sid not in self.selection:
+                    self.set_selection({sid})
+                self.drag = {"mode": "move", "x0": e.x, "y0": e.y, "applied": (0.0, 0.0),
+                             "sids": self.ordered(self.selection)}
+            else:                          # 點到空白：開始框選
+                if not shift:
+                    self.set_selection(())
+                band = self.canvas.create_rectangle(e.x, e.y, e.x, e.y, outline=SEL_COLOR,
+                                                    dash=(3, 3), tags=("band",))
+                self.drag = {"mode": "band", "x0": e.x, "y0": e.y, "item": band, "add": shift}
+
+    def on_drag(self, e):
+        self.on_move(e)
+        if self.tool == "select":
+            d = self.drag
+            if not d:
+                return
+            if d["mode"] == "move":
+                w, h = self.size()
+                objs = [self.strokes[s] for s in d["sids"] if s in self.strokes]
+                dx, dy = clamp_move(objs, (e.x - d["x0"]) / w, (e.y - d["y0"]) / h)
+                ax, ay = d["applied"]
+                for s in d["sids"]:
+                    self.canvas.move("s_" + s, (dx - ax) * w, (dy - ay) * h)
+                self.canvas.move("selbox", (dx - ax) * w, (dy - ay) * h)
+                d["applied"] = (dx, dy)
+            else:
+                self.canvas.coords(d["item"], d["x0"], d["y0"], e.x, e.y)
+            return
+        if self.tool in ("pen", "eraser") and self.cur_sid:
+            self.continue_stroke(e)
+
+    def on_release(self, e):
+        if self.tool == "select" and self.drag:
+            d, self.drag = self.drag, None
+            if d["mode"] == "move":
+                dx, dy = round(d["applied"][0], 5), round(d["applied"][1], 5)
+                sids = [s for s in d["sids"] if s in self.strokes]
+                if sids and (dx or dy):    # 放開滑鼠才送出一次 move，減少流量
+                    for s in sids:
+                        move_obj(self.strokes[s], dx, dy)
+                    self.net.send(type="move", sids=sids, dx=dx, dy=dy)
+                self.refresh_sel()
+            else:
+                x0, y0, x1, y1 = self.canvas.coords(d["item"])
+                self.canvas.delete(d["item"])
+                found = set()
+                for item in self.canvas.find_overlapping(min(x0, x1), min(y0, y1),
+                                                         max(x0, x1), max(y0, y1)):
+                    for tag in self.canvas.gettags(item):
+                        if tag.startswith("s_") and tag[2:] in self.strokes:
+                            found.add(tag[2:])
+                self.set_selection((self.selection | found) if d["add"] else found)
+                if self.selection:
+                    self.flash(f"已選取 {len(self.selection)} 個物件")
+            return
+        self.flush()
+        self.cur_sid = None
+
+    def on_double(self, e):
+        """雙擊文字：編輯。"""
+        if self.tool not in ("select", "text"):
+            return
+        sid = self.hit(e.x, e.y, text_only=True)
+        if sid and not (self.editor and self.editor["sid"] == sid):
+            self.drag = None
+            self.open_editor(sid=sid)
+
+    def on_move(self, e):
+        self.mouse = self.to_norm(e.x, e.y)
+        now = time.monotonic()
+        if now - self.last_cursor_t >= CURSOR_INTERVAL:
+            self.last_cursor_t = now
+            self.net.send(type="cursor", x=round(self.mouse[0], 4), y=round(self.mouse[1], 4))
+
+    # ====================== 畫筆 ======================
+    def start_stroke(self, e):
+        self.cur_sid = new_sid()
         p = self.to_norm(e.x, e.y)
-        color = BG if self.eraser else self.color
-        width = self.width_var.get() * (3 if self.eraser else 1)
+        eraser = self.tool == "eraser"
+        color = BG if eraser else self.color
+        width = self.width_var.get() * (3 if eraser else 1)
         self.strokes[self.cur_sid] = {"color": color, "width": width, "pts": [p],
                                       "owner": self.my_name}
         self.pending, self.last_sent, self.last_px = [p], None, (e.x, e.y)
         self.draw_pts(self.cur_sid, color, width, [p])
 
-    def on_drag(self, e):
-        if not self.cur_sid:
+    def continue_stroke(self, e):
+        s = self.strokes.get(self.cur_sid)
+        if s is None:                      # 正在畫的筆跡被別人刪掉了
+            self.cur_sid = None
             return
-        s = self.strokes[self.cur_sid]
         p = self.to_norm(e.x, e.y)
         s["pts"].append(p)
         self.pending.append(p)
@@ -243,24 +629,15 @@ class App:
         self.canvas.create_line(lx, ly, e.x, e.y, fill=s["color"], width=s["width"],
                                 capstyle=tk.ROUND, tags=("s_" + self.cur_sid, "stroke"))
         self.last_px = (e.x, e.y)
-        self.on_move(e)
-
-    def on_release(self, e):
-        self.flush()
-        self.cur_sid = None
-
-    def on_move(self, e):
-        now = time.monotonic()
-        if now - self.last_cursor_t >= CURSOR_INTERVAL:
-            self.last_cursor_t = now
-            x, y = self.to_norm(e.x, e.y)
-            self.net.send(type="cursor", x=round(x, 4), y=round(y, 4))
 
     def flush(self):
         """把累積的點一次送出 (批次化，大幅減少封包數)。"""
         if not self.cur_sid or not self.pending:
             return
-        s = self.strokes[self.cur_sid]
+        s = self.strokes.get(self.cur_sid)
+        if s is None:
+            self.pending = []
+            return
         pts = ([self.last_sent] if self.last_sent else []) + self.pending
         pts = [[round(x, 4), round(y, 4)] for x, y in pts]
         self.net.send(type="draw", sid=self.cur_sid, color=s["color"],
@@ -277,7 +654,7 @@ class App:
             self.root.after_cancel(self.resize_job)
         self.resize_job = self.root.after(80, self.redraw_all)
 
-    # ---------- 工具 ----------
+    # ====================== 其他工具 ======================
     def undo(self):
         self.flush()
         self.net.send(type="undo")      # 伺服器會廣播 remove 給所有人 (包含自己)
@@ -287,6 +664,7 @@ class App:
             self.net.send(type="clear")
 
     def save(self):
+        self.commit_editor()
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
             filetypes=[("白板檔 (可再開啟)", "*.json"), ("PostScript 圖檔 (僅圖片)", "*.ps")])
@@ -295,8 +673,10 @@ class App:
         try:
             if path.lower().endswith(".ps"):
                 self.canvas.itemconfigure("cursor", state="hidden")
+                self.canvas.itemconfigure("selbox", state="hidden")
                 self.canvas.postscript(file=path, colormode="color")
                 self.canvas.itemconfigure("cursor", state="normal")
+                self.canvas.itemconfigure("selbox", state="normal")
             else:
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(dump_board(self.strokes.values()), f, ensure_ascii=False)
@@ -306,6 +686,7 @@ class App:
         messagebox.showinfo("儲存", f"已儲存到\n{path}")
 
     def open_file(self):
+        self.commit_editor()
         path = filedialog.askopenfilename(
             filetypes=[("白板檔", "*.json"), ("所有檔案", "*.*")])
         if not path:
@@ -316,7 +697,7 @@ class App:
             return
         try:
             with open(path, encoding="utf-8") as f:
-                strokes = parse_board(json.load(f))
+                objs = parse_board(json.load(f))
         except (OSError, ValueError) as e:     # JSONDecodeError 也是 ValueError
             messagebox.showerror("開啟失敗", f"無法讀取這個檔案:\n{e}")
             return
@@ -324,31 +705,21 @@ class App:
             messagebox.showwarning("開啟", "目前離線，連上伺服器後再試一次。")
             return
         ans = messagebox.askyesnocancel(
-            "開啟", f"檔案共有 {len(strokes)} 筆筆跡，會同步給房間內所有人。\n\n"
+            "開啟", f"檔案共有 {len(objs)} 個物件，會同步給房間內所有人。\n\n"
                     "是：先清除目前畫布再載入\n否：疊加在目前畫布上")
         if ans is None:
             return
         if ans:
-            self.pending_load = strokes         # 等伺服器廣播 clear 回來再載入，避免被清掉
+            self.pending_load = objs         # 等伺服器廣播 clear 回來再載入，避免被清掉
             self.net.send(type="clear")
         else:
-            self.load_strokes(strokes)
+            self.load_objects(objs)
 
-    def load_strokes(self, strokes):
-        """把讀進來的筆跡當成自己畫的送給伺服器 (之後也能用復原逐筆撤銷)。"""
-        self.flush()
-        for s in strokes:
-            sid = uuid.uuid4().hex[:12]
-            for chunk in chunk_pts(s["pts"]):
-                self.net.send(type="draw", sid=sid, color=s["color"], width=s["width"],
-                              pts=[[round(x, 4), round(y, 4)] for x, y in chunk])
-            self.strokes[sid] = {"color": s["color"], "width": s["width"],
-                                 "pts": list(s["pts"]), "owner": self.my_name}
-            self.draw_pts(sid, s["color"], s["width"], s["pts"])
-        self.status.config(text=f"已載入 {len(strokes)} 筆筆跡", fg="#1565c0")
-        self.root.after(2000, self.refresh_status)
+    def load_objects(self, objs):
+        self.add_objects(objs)
+        self.flash(f"已載入 {len(objs)} 個物件")
 
-    # ---------- 他人游標 ----------
+    # ====================== 他人游標 ======================
     def place_cursor(self, name, x, y):
         px, py = self.to_px((x, y))
         cur = self.cursors.get(name)
@@ -357,7 +728,7 @@ class App:
             dot = self.canvas.create_oval(0, 0, 0, 0, fill=col, outline="white",
                                           tags=("cursor",))
             txt = self.canvas.create_text(0, 0, text=name, fill=col, anchor="nw",
-                                          font=("TkDefaultFont", 10, "bold"), tags=("cursor",))
+                                          font=(self.family, 10, "bold"), tags=("cursor",))
             cur = self.cursors[name] = [dot, txt, x, y]
         cur[2], cur[3] = x, y
         self.canvas.coords(cur[0], px - 5, py - 5, px + 5, py + 5)
@@ -369,7 +740,7 @@ class App:
         if cur:
             self.canvas.delete(cur[0], cur[1])
 
-    # ---------- 處理伺服器訊息 ----------
+    # ====================== 處理伺服器訊息 ======================
     def poll(self):
         for _ in range(2000):
             try:
@@ -381,6 +752,14 @@ class App:
             except (KeyError, TypeError, ValueError, tk.TclError):
                 pass
         self.root.after(15, self.poll)
+
+    def object_gone(self, sid):
+        """物件被別人刪除 / 清除時，同步清掉本機的選取與編輯狀態。"""
+        self.selection.discard(sid)
+        if self.editor and self.editor["sid"] == sid:
+            self.commit_editor(cancel=True)
+        if self.cur_sid == sid:
+            self.cur_sid = None
 
     def handle(self, m):
         t = m.get("type")
@@ -394,8 +773,13 @@ class App:
         elif t == "welcome":              # (重新)連線 -> 以伺服器的完整狀態為準
             self.my_name = m["name"]
             self.users = m["users"]
-            self.cur_sid, self.pending, self.pending_load = None, [], None
+            if self.editor and self.editor["sid"]:
+                self.commit_editor(cancel=True)
+            if self.drag and self.drag["mode"] == "band":
+                self.canvas.delete(self.drag["item"])
+            self.cur_sid, self.pending, self.pending_load, self.drag = None, [], None, None
             self.strokes = {s["sid"]: s for s in m["strokes"]}
+            self.selection = set()
             self.redraw_all()
             self.refresh_status()
         elif t == "draw":
@@ -403,20 +787,46 @@ class App:
                                                    "pts": [], "owner": m["owner"]})
             s["pts"].extend(m["pts"])
             self.draw_pts(m["sid"], m["color"], m["width"], m["pts"])
+            if m["sid"] in self.selection:
+                self.refresh_sel()
+        elif t == "text":
+            self.strokes[m["sid"]] = {k: m[k] for k in
+                                      ("kind", "x", "y", "text", "color", "size", "owner")}
+            self.redraw_obj(m["sid"])
+            if m["sid"] in self.selection:
+                self.refresh_sel()
+        elif t == "move":
+            w, h = self.size()
+            dragging = set(self.drag["sids"]) if self.drag and self.drag["mode"] == "move" else ()
+            for sid in m["sids"]:
+                if sid in self.strokes:
+                    move_obj(self.strokes[sid], m["dx"], m["dy"])
+                    if sid in dragging:    # 我正在拖曳的物件被別人移動：以模型為準重畫
+                        self.redraw_obj(sid)
+                        self.canvas.move("s_" + sid, *(v * s for v, s in
+                                                       zip(self.drag["applied"], (w, h))))
+                    else:
+                        self.canvas.move("s_" + sid, m["dx"] * w, m["dy"] * h)
+            if self.editor and self.editor["sid"] in m["sids"]:
+                o = self.strokes[self.editor["sid"]]
+                self.editor["pos"] = [o["x"], o["y"]]
+                self.canvas.coords(self.editor["item"], *self.to_px(self.editor["pos"]))
+            self.refresh_sel()
         elif t == "remove":
             self.strokes.pop(m["sid"], None)
             self.canvas.delete("s_" + m["sid"])
-            if self.cur_sid == m["sid"]:
-                self.cur_sid = None
+            self.object_gone(m["sid"])
+            self.refresh_sel()
         elif t == "clear":
+            for sid in list(self.strokes):
+                self.object_gone(sid)
             self.strokes.clear()
             self.canvas.delete("stroke")
-            self.cur_sid = None
-            self.status.config(text=f"{m['by']} 清除了畫布", fg="#1565c0")
-            self.root.after(2000, self.refresh_status)
+            self.refresh_sel()
+            self.flash(f"{m['by']} 清除了畫布")
             if self.pending_load is not None and m["by"] == self.my_name:
-                strokes, self.pending_load = self.pending_load, None
-                self.load_strokes(strokes)
+                objs, self.pending_load = self.pending_load, None
+                self.load_objects(objs)
         elif t == "cursor":
             self.place_cursor(m["name"], m["x"], m["y"])
         elif t == "user_join":
@@ -431,6 +841,7 @@ class App:
             self.status.config(text="錯誤: " + m.get("text", ""), fg="#c62828")
 
     def on_close(self):
+        self.commit_editor()
         self.net.stop()
         self.root.destroy()
 
