@@ -534,11 +534,10 @@ class ClientTest(unittest.TestCase):
         self.assertEqual((o["x"], o["y"]), (0.3, 0.2))
 
     def test_room_code_shown(self):
-        self.assertEqual(self.a.app.code,
-                         client.roomcode.encode(client.local_ip(), PORT, self.room))
+        self.assertEqual(self.a.app.code, self.room)
         self.a.app.copy_code()
-        self.assertEqual(self.a.root.clipboard, self.a.app.code)
-        self.assertTrue(any(w.kw.get("text") == self.a.app.code for w in self.a.root.widgets))
+        self.assertEqual(self.a.root.clipboard, self.room)
+        self.assertTrue(any(w.kw.get("text") == self.room for w in self.a.root.widgets))
 
     def test_band_select(self):
         A = self.a.app
@@ -689,123 +688,100 @@ class RestartTest(unittest.TestCase):
 class LauncherTest(unittest.TestCase):
     """start.py 不帶參數時的小視窗：建立房間 / 輸入房間號加入。"""
 
-    def run_launcher(self, action):
+    PORT = 9192
+    SERVER = f"ws://127.0.0.1:{PORT}"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port",
+                                  str(cls.PORT), "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
+        time.sleep(0.8)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.p.terminate()
+        cls.p.wait()
+
+    def run_launcher(self, action, server=SERVER):
         import start
         fake_tk.Tk.on_mainloop = action
         try:
-            return start.launcher_gui()
+            return start.launcher_gui(server)
         finally:
             fake_tk.Tk.on_mainloop = None
 
     @staticmethod
-    def entries(root):
-        return [w for w in root.widgets if isinstance(w, fake_tk.Entry)]
+    def parts(root):
+        entries = [w for w in root.widgets if isinstance(w, fake_tk.Entry)]
+        status = next(w for w in root.widgets if w.kw.get("wraplength"))
+        return entries[0].kw["textvariable"], entries[1].kw["textvariable"], status
 
-    def test_create(self):
-        def act(root):
-            self.entries(root)[0].kw["textvariable"].set("  amy ")
-            root.button("建立房間").kw["command"]()
-        self.assertEqual(self.run_launcher(act), {"action": "create", "name": "amy"})
-
-    def test_join(self):
-        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", "9189",
-                              "--udp-port", "9190"], cwd=HERE, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: (p.terminate(), p.wait()))
-        time.sleep(0.8)
-        seen = {}
-
-        def act(root):
-            code_var = self.entries(root)[1].kw["textvariable"]
-            status = next(w for w in root.widgets if w.kw.get("wraplength"))
-            join = root.button("加入房間").kw["command"]
-            settled = lambda: not status.kw["text"].startswith("連線中") or root.destroyed  # noqa
-            join()
-            seen["empty"] = status.kw["text"]
-            for key, code in [("bad", "A0?11"),
-                              ("down", client.roomcode.encode("127.0.0.1", 9191))]:  # 沒有人開
-                code_var.set(code)
-                join()
-                root.pump(settled)
-                seen[key] = status.kw["text"]
-            code_var.set(client.roomcode.encode("127.0.0.1", 9189).lower())
-            join()
-            root.pump(lambda: root.destroyed)
-        r = self.run_launcher(act)
-        self.assertEqual(seen["empty"], "請輸入房間號")
-        self.assertIn("無效的字元", seen["bad"])
-        self.assertIn("沒有開伺服器", seen["down"])
-        self.assertEqual(r["action"], "join")
-        self.assertEqual(r["target"][:3], ("127.0.0.1", 9189, "lobby"))
-
-    def test_online_mode(self):
-        """設定線上伺服器時：建立房間拿到隨機房間號、輸入房間號加入、打錯會提示。"""
-        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", "9192",
-                              "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: (p.terminate(), p.wait()))
-        time.sleep(0.8)
-        import start
-        server = "ws://127.0.0.1:9192"
-
+    def test_create_join_and_draw(self):
         def create(root):
+            name, _, _ = self.parts(root)
+            name.set("  amy ")
             root.button("建立房間").kw["command"]()
             root.pump(lambda: root.destroyed)
-        fake_tk.Tk.on_mainloop = create
-        try:
-            r = start.launcher_gui(server)
-        finally:
-            fake_tk.Tk.on_mainloop = None
-        self.assertEqual(r["action"], "online")
+        r = self.run_launcher(create)
         code = r["code"]
-        self.assertEqual(len(code), 5)
+        self.assertEqual((len(code), r["name"]), (5, "amy"))
         seen = {}
 
         def join(root):
-            code_var = self.entries(root)[1].kw["textvariable"]
-            status = next(w for w in root.widgets if w.kw.get("wraplength"))
+            _, code_var, status = self.parts(root)
             btn = root.button("加入房間").kw["command"]
-            code_var.set("ZZZZZ" if code != "ZZZZZ" else "00000")
-            btn()
-            root.pump(lambda: not status.kw["text"].startswith("連線中"))
-            seen["missing"] = status.kw["text"]
+            settled = lambda: not status.kw["text"].startswith("連線中") or root.destroyed  # noqa
+            for key, typed in [("empty", ""), ("bad", "K7?2M"), ("short", "K7Q"),
+                               ("missing", "ZZZZZ" if code != "ZZZZZ" else "00000")]:
+                code_var.set(typed)
+                btn()
+                root.pump(settled)
+                seen[key] = status.kw["text"]
             code_var.set(code.lower())
             btn()
             root.pump(lambda: root.destroyed)
-        fake_tk.Tk.on_mainloop = join
-        try:
-            r = start.launcher_gui(server)
-        finally:
-            fake_tk.Tk.on_mainloop = None
+        r = self.run_launcher(join)
+        self.assertEqual(seen["empty"], "請輸入房間號")
+        self.assertIn("無效的字元", seen["bad"])
+        self.assertIn("5 碼", seen["short"])
         self.assertIn("找不到房間", seen["missing"])
-        self.assertNotIn(code[0], "ABCD")                      # 線上房間號不會跟區網的混淆
-
-        # 沒有設定線上伺服器的電腦輸入線上房間號 -> 提示要 git pull 設定
-        def no_server(root):
-            self.entries(root)[1].kw["textvariable"].set(code)
-            root.button("加入房間").kw["command"]()
-            status = next(w for w in root.widgets if w.kw.get("wraplength"))
-            root.pump(lambda: not status.kw["text"].startswith("連線中"))
-            seen["hint"] = status.kw["text"]
-            root.destroyed = True
-        fake_tk.Tk.on_mainloop = no_server
-        try:
-            start.launcher_gui(None)
-        finally:
-            fake_tk.Tk.on_mainloop = None
-        self.assertIn("還沒設定線上伺服器", seen["hint"])
-        self.assertIn("git pull", seen["hint"])
-        self.assertEqual(r, {"action": "online", "code": code, "name": r["name"]})
+        self.assertEqual(r["code"], code)
 
         # 兩個客戶端用 WebSocket 連進同一個房間協作
-        a = Board("amy", code, server=server)
-        b = Board("ben", code, server=server)
+        a = Board("amy", code, server=self.SERVER)
+        b = Board("ben", code, server=self.SERVER)
         self.addCleanup(a.close)
         self.addCleanup(b.close)
-        self.assertEqual(a.app.code, code)                     # 視窗上顯示線上房間號
+        self.assertEqual(a.app.code, code)                     # 視窗上顯示房間號
         a.drag([(100, 100), (300, 200)])
         b.wait(lambda: len(b.app.strokes) == 1)
         a.app.set_tool("text")
         a.app.on_press(ev(400, 300)); a.app.editor["w"].type("線上你好"); a.app.commit_editor()
         b.wait(lambda: any(o.get("text") == "線上你好" for o in b.app.strokes.values()))
+
+    def test_no_server_configured(self):
+        seen = {}
+
+        def act(root):
+            _, _, status = self.parts(root)
+            seen["status"] = status.kw["text"]
+            seen["disabled"] = [root.button(t).kw.get("state") for t in ("建立房間", "加入房間")]
+        self.assertEqual(self.run_launcher(act, server=None), {})
+        self.assertIn("git pull", seen["status"])
+        self.assertEqual(seen["disabled"], ["disabled", "disabled"])
+
+    def test_server_down(self):
+        seen = {}
+
+        def act(root):
+            _, _, status = self.parts(root)
+            root.button("建立房間").kw["command"]()
+            root.pump(lambda: not status.kw["text"].startswith("建立房間中"))
+            seen["status"] = status.kw["text"]
+            seen["enabled"] = root.button("建立房間").kw.get("state")
+        self.assertEqual(self.run_launcher(act, server="ws://127.0.0.1:9199"), {})
+        self.assertIn("連不上線上伺服器", seen["status"])
+        self.assertEqual(seen["enabled"], "normal")            # 失敗後按鈕恢復可按
 
 
 if __name__ == "__main__":

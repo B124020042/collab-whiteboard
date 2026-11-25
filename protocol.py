@@ -14,8 +14,8 @@ client -> server
   {"type":"delete", "sids":[...]}                                           # 刪除物件
   {"type":"cursor", "x", "y"}
   {"type":"ping"}                      # 探測伺服器 (不需先 hello)，回覆 pong
-  {"type":"create_room"}               # (線上) 建立新房間，回覆 room_created
-  {"type":"room_info", "room"}         # (線上) 查詢房間是否存在，回覆 room_info
+  {"type":"create_room"}               # 建立新房間，回覆 room_created
+  {"type":"room_info", "room"}         # 查詢房間是否存在，回覆 room_info
   {"type":"restore", "strokes":[...]}  # 伺服器重啟後房間是空的：把本機畫面傳回去復原
   {"type":"heartbeat"}                 # 心跳 (避免雲端平台判定閒置而休眠)
   {"type":"undo"}                      # 移除自己最後新增的物件
@@ -34,16 +34,12 @@ server -> client
   {"type":"room_created", "code"}      {"type":"room_info", "room", "exists", "users"}
   {"type":"reset",     "strokes", "by"}   # 畫面被整個復原 (等同重新 welcome)
   {"type":"error",     "text"}
-
-自動探索 (UDP)：客戶端廣播 DISCOVER_MAGIC 到 DISCOVERY_PORT，伺服器回傳一個 pong JSON。
 """
 import json
 import math
 import re
 
 DEFAULT_PORT = 9100
-DISCOVERY_PORT = 9101
-DISCOVER_MAGIC = b"COLLAB_WHITEBOARD_DISCOVER"
 MAX_PTS_PER_MSG = 500          # 單一 draw 訊息最多幾個點
 MAX_TEXT = 1000                # 文字框最多字數
 MIN_FONT, MAX_FONT = 6, 120
@@ -52,19 +48,6 @@ MIN_SCALE, MAX_SCALE = 0.05, 20.0
 FILE_VERSION = 2
 APP_ID = "collab-whiteboard"
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-
-
-def local_ip():
-    """取得本機在區域網路上的 IP (不會真的送出封包)。"""
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
 
 
 def encode(**obj) -> bytes:

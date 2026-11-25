@@ -152,8 +152,8 @@ class WhiteboardTest(unittest.TestCase):
 
     def test_bot_stress(self):
         watcher = C("watcher", "botroom")
-        r = subprocess.run([sys.executable, str(HERE / "bot.py"), "--port", str(PORT),
-                            "--room", "botroom", "--count", "3"], cwd=HERE, timeout=30)
+        r = subprocess.run([sys.executable, str(HERE / "bot.py"), "botroom", "--server",
+                            f"ws://127.0.0.1:{PORT}", "--count", "3"], cwd=HERE, timeout=30)
         self.assertEqual(r.returncode, 0)
         watcher.until("user_leave")
         self.assertEqual(len(C("v", "botroom").welcome["strokes"]), 3)

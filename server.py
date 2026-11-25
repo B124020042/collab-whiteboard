@@ -8,10 +8,10 @@
     一行 JSON          -> 原本的 TCP 協定 (區域網路的 client.py)
     HTTP + Upgrade     -> WebSocket (線上：雲端平台只轉發 HTTP / WebSocket)
     一般 HTTP GET      -> 回傳狀態頁 (雲端平台的健康檢查)
-- 線上模式 (--public)：create_room 產生隨機房間號，pong 不公開房間清單
+- create_room 產生隨機房間號；--public (雲端部署用) 時 pong 不公開房間清單、空房間保留
 
-    python3 server.py                      # 區網
-    python3 server.py --public             # 雲端 (port 取自環境變數 PORT)
+    python3 server.py --public             # 雲端 (Render 會用這個指令，port 取自環境變數 PORT)
+    python3 server.py                      # 開發 / 測試：在本機執行 (預設 port 9100)
 """
 import argparse
 import asyncio
@@ -25,9 +25,9 @@ import time
 from collections import OrderedDict
 
 from transport import MAX_MESSAGE, read_http_headers, ws_accept_key, ws_frame, ws_read_message
-from protocol import (APP_ID, DEFAULT_PORT, DISCOVER_MAGIC, DISCOVERY_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
-                      clamp_move, clamp_scale, clean_obj, decode, encode, is_text, local_ip,
-                      move_obj, scale_obj, valid_color)
+from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
+                      clamp_move, clamp_scale, clean_obj, decode, encode, is_text, move_obj,
+                      scale_obj, valid_color)
 
 MAX_NAME = 16
 MAX_ROOM = 20
@@ -36,7 +36,6 @@ MAX_SIDS_PER_MSG = MAX_STROKES
 MAX_ROOMS = 500
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford Base32 (不含 I L O U)
 CODE_LEN = 5
-CODE_FIRST = "".join(ch for ch in CODE_ALPHABET if ch not in "ABCD")  # A~D 開頭留給區網房間號
 HTTP_METHODS = (b"GET ", b"HEAD ", b"POST ", b"PUT ", b"OPTIONS ", b"DELETE ", b"PATCH ")
 
 
@@ -57,20 +56,6 @@ class Room:
         self.touched = time.monotonic()    # 最後有人使用的時間 (清理閒置房間用)
 
 
-class Discovery(asyncio.DatagramProtocol):
-    """回應區網內的 UDP 探索廣播，讓 start.py 自動找到這台伺服器。"""
-
-    def __init__(self, srv):
-        self.srv = srv
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, addr):
-        if data.strip() == DISCOVER_MAGIC:
-            self.transport.sendto(json.dumps(self.srv.info(), ensure_ascii=False).encode(), addr)
-
-
 class WhiteboardServer:
     def __init__(self, port=DEFAULT_PORT, public=False):
         self.rooms = {}
@@ -89,8 +74,7 @@ class WhiteboardServer:
     def new_room_code(self):
         self.purge_rooms()
         while True:
-            code = secrets.choice(CODE_FIRST) + "".join(
-                secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN - 1))
+            code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
             if code not in self.rooms:
                 self.rooms[code] = Room(code)
                 return code
@@ -351,27 +335,15 @@ async def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", DEFAULT_PORT)),
                     help="TCP port (預設讀環境變數 PORT，沒有則 9100)")
-    ap.add_argument("--udp-port", type=int, default=DISCOVERY_PORT, help="自動探索用的 UDP port")
     ap.add_argument("--public", action="store_true",
-                    help="線上模式：部署到雲端時使用 (不公開房間清單、不開 UDP 探索)")
+                    help="部署到雲端時使用 (不公開房間清單、空房間保留)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     srv = WhiteboardServer(args.port, public=args.public)
     server = await asyncio.start_server(srv.handle, args.host, args.port, limit=MAX_MESSAGE)
-    if args.public:
-        logging.info("線上白板伺服器啟動於 port %d", args.port)
-        async with server:
-            await server.serve_forever()
-        return
-    try:
-        await asyncio.get_running_loop().create_datagram_endpoint(
-            lambda: Discovery(srv), local_addr=(args.host, args.udp_port))
-    except OSError as e:
-        logging.warning("UDP 自動探索無法啟用 (%s)，其他電腦仍可用 --host 手動連線", e)
-    ip = local_ip()
-    logging.info("白板伺服器啟動於 %s:%d", args.host, args.port)
-    logging.info("其他電腦可執行: python3 start.py  (自動尋找)  或  "
-                 "python3 client.py --host %s --port %d", ip, args.port)
+    logging.info("白板伺服器啟動於 port %d%s", args.port, " (public)" if args.public else "")
+    if not args.public:
+        logging.info("本機測試：python3 start.py --server ws://127.0.0.1:%d", args.port)
     async with server:
         await server.serve_forever()
 

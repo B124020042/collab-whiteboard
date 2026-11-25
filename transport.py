@@ -17,6 +17,7 @@ import socket
 import ssl
 import struct
 import threading
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from protocol import DEFAULT_PORT, encode
@@ -138,6 +139,21 @@ def parse_server(server, default_port=DEFAULT_PORT):
         raise ValueError(f"伺服器網址缺少主機名稱：{server}")
     port = u.port or {"tcp": default_port, "ws": 80, "wss": 443}[scheme]
     return scheme, u.hostname, port, (u.path or "/") + (f"?{u.query}" if u.query else "")
+
+
+CONFIG = Path(__file__).resolve().parent / "config.json"
+
+
+def configured_server(cli=None):
+    """伺服器網址：參數 > 環境變數 WHITEBOARD_SERVER > config.json。沒有設定回傳 None。"""
+    if cli and cli.strip():
+        return cli.strip()
+    if os.environ.get("WHITEBOARD_SERVER", "").strip():
+        return os.environ["WHITEBOARD_SERVER"].strip()
+    try:
+        return (json.loads(CONFIG.read_text(encoding="utf-8")).get("server") or "").strip() or None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def is_online(server):

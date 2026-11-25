@@ -12,6 +12,7 @@ import argparse
 import json
 import queue
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
@@ -20,11 +21,11 @@ import zlib
 from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
-import roomcode
-from transport import ConnectionClosed, is_online, open_connection, parse_server
+from transport import (ConnectionClosed, configured_server, is_online, open_connection,
+                       parse_server)
 from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
                       clamp_scale, decode, dump_board, encode, is_text, move_obj,
-                      local_ip, objects_bbox, parse_board, scale_obj)
+                      objects_bbox, parse_board, scale_obj)
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -121,20 +122,10 @@ def text_width_units(line):
     return sum(2 if ord(ch) > 0x2E80 else 1 for ch in line)
 
 
-def room_code_for(host, port, room):
-    """依連線目標算出房間號 (連到本機時用本機的區網 IP)。"""
-    try:
-        ip = local_ip() if host in ("127.0.0.1", "localhost") else socket.gethostbyname(host)
-        return roomcode.encode(ip, port, room)
-    except (OSError, ValueError):
-        return None
-
-
 class App:
     def __init__(self, root, net, inbox, code=None):
         self.root, self.net, self.inbox = root, net, inbox
-        self.code = code or (net.room if net.online_mode
-                             else room_code_for(net.host, net.port, net.room))
+        self.code = code or net.room       # 房間號 (就是房間名稱)
         self.welcomed = False      # 收過 welcome 了嗎 (用來判斷是否為「重新」連線)
         self.my_name = net.name
         self.online = False
@@ -1088,13 +1079,10 @@ class App:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="協作白板客戶端")
-    ap.add_argument("--server", help="伺服器網址，例如 wss://xxx.onrender.com (線上) 或 host:port")
-    ap.add_argument("--host", default="127.0.0.1", help="區網伺服器 IP (未指定 --server 時使用)")
-    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
+    ap = argparse.ArgumentParser(description="協作白板客戶端 (一般請用 start.py 啟動)")
+    ap.add_argument("--server", help="伺服器網址 (預設讀 config.json)，例如 wss://xxx.onrender.com")
     ap.add_argument("--name", help="暱稱 (未指定會詢問)")
-    ap.add_argument("--room", default="lobby", help="房間名稱 (預設 lobby)")
-    ap.add_argument("--code", help="顯示用的房間號 (start.py 會自動帶入)")
+    ap.add_argument("--room", required=True, help="房間號 (通常由 start.py 帶入)")
     args = ap.parse_args()
 
     root = tk.Tk()
@@ -1104,8 +1092,11 @@ def main():
         name = simpledialog.askstring("協作白板", "請輸入暱稱:", parent=root) or "guest"
         root.deiconify()
     inbox = queue.Queue()
-    net = Net(args.server or f"{args.host}:{args.port}", name, args.room, inbox)
-    App(root, net, inbox, code=args.code)
+    server = args.server or configured_server()
+    if not server:
+        sys.exit("沒有設定伺服器網址：請用 --server 或在 config.json 填入")
+    net = Net(server, name, args.room, inbox)
+    App(root, net, inbox)
     net.start()
     root.mainloop()
 
