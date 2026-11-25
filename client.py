@@ -21,8 +21,8 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
 from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
-                      clamp_scale, decode, dump_board, encode, is_text, move_obj, parse_board,
-                      scale_obj)
+                      clamp_scale, decode, dump_board, encode, is_text, move_obj,
+                      objects_bbox, parse_board, scale_obj)
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -181,17 +181,18 @@ class App:
         # 第二列：編輯動作與檔案
         bar2 = tk.Frame(self.root, padx=6, pady=2)
         bar2.pack(side=tk.TOP, fill=tk.X)
-        for text, cmd in [("復原 Ctrl+Z", self.undo), ("複製 Ctrl+C", self.copy),
-                          ("剪下 Ctrl+X", self.cut), ("貼上 Ctrl+V", self.paste),
-                          ("刪除 Del", self.delete_selection), ("全選 Ctrl+A", self.select_all),
-                          ("清除畫布", self.clear), ("開啟 Ctrl+O", self.open_file),
-                          ("儲存 Ctrl+S", self.save)]:
+        for text, cmd in [("復原 Ctrl+Z", self.undo), ("清除畫布", self.clear),
+                          ("開啟 Ctrl+O", self.open_file), ("儲存 Ctrl+S", self.save)]:
             tk.Button(bar2, text=text, command=cmd).pack(side=tk.LEFT, padx=1)
         self.status = tk.Label(bar2, text="連線中...", fg="#888", anchor="e")
         self.status.pack(side=tk.RIGHT)
 
-        self.users_lbl = tk.Label(self.root, text="", anchor="w", fg="#555", padx=8)
-        self.users_lbl.pack(side=tk.BOTTOM, fill=tk.X)
+        bottom = tk.Frame(self.root)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        self.users_lbl = tk.Label(bottom, text="", anchor="w", fg="#555", padx=8)
+        self.users_lbl.pack(side=tk.LEFT)
+        tk.Label(bottom, text="按右鍵：複製 / 剪下 / 貼上 / 刪除", fg="#999",
+                 padx=8).pack(side=tk.RIGHT)
 
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0, takefocus=1)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -201,6 +202,18 @@ class App:
         self.canvas.bind("<Double-Button-1>", self.on_double)
         self.canvas.bind("<Motion>", self.on_move)
         self.canvas.bind("<Configure>", self.on_resize)
+
+        # 右鍵選單 (macOS 的右鍵是 Button-2，也支援 Control+點擊)
+        try:
+            self.aqua = self.root.tk.call("tk", "windowingsystem") == "aqua"
+        except Exception:
+            self.aqua = False
+        self.mod_label = "Cmd" if self.aqua else "Ctrl"
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.canvas.bind("<Button-3>", self.on_context)
+        if self.aqua:
+            self.canvas.bind("<Button-2>", self.on_context)
+            self.canvas.bind("<Control-Button-1>", self.on_context)
 
         # 快捷鍵 (Windows/Linux 用 Ctrl，macOS 另外綁 Command)
         for key, fn in [("z", self.undo), ("c", self.copy), ("x", self.cut), ("v", self.paste),
@@ -483,30 +496,46 @@ class App:
             self.delete_sids(self.ordered(self.selection))
             self.flash(f"已剪下 {n} 個物件")
 
-    def paste(self):
+    def read_clipboard(self):
+        """讀取剪貼簿：回傳 (物件清單, 是否為純文字)；沒有可貼的內容回傳 None。"""
         try:
             txt = self.root.clipboard_get()
         except tk.TclError:
             txt = None
-        objs, offset = None, True
         if txt:
             try:
                 data = json.loads(txt)
                 if isinstance(data, dict) and data.get("app") == APP_ID:
                     objs = parse_board(data)          # 白板物件
+                    return (objs, False) if objs else None
             except ValueError:
                 pass
-            if objs is None and txt.strip():          # 一般文字 -> 在滑鼠位置建立文字框
-                objs = [{"kind": "text", "x": self.mouse[0], "y": self.mouse[1],
+            if txt.strip():                           # 一般文字 -> 建立文字框
+                return [{"kind": "text", "x": self.mouse[0], "y": self.mouse[1],
                          "text": txt.rstrip()[:MAX_TEXT], "color": self.color,
-                         "size": self.font_size()}]
-                offset = False
-        elif self.clip:
+                         "size": self.font_size()}], True
+            return None
+        if self.clip:
             objs = parse_board(self.clip)
-        if not objs:
+            return (objs, False) if objs else None
+        return None
+
+    def paste(self, at=None):
+        """貼上；at 為比例座標時 (右鍵選單)，把內容的左上角放在該位置。"""
+        got = self.read_clipboard()
+        if not got:
             self.flash("剪貼簿是空的")
             return
-        if offset:                                    # 每次貼上都往右下偏移一點，避免完全重疊
+        objs, plain = got
+        if at is not None:
+            if plain:
+                objs[0]["x"], objs[0]["y"] = at
+            else:
+                minx, miny, _, _ = objects_bbox(objs)
+                dx, dy = clamp_move(objs, at[0] - minx, at[1] - miny)
+                for o in objs:
+                    move_obj(o, dx, dy)
+        elif not plain:                               # 每次貼上都往右下偏移一點，避免完全重疊
             self.paste_count += 1
             d = PASTE_OFFSET * self.paste_count
             dx, dy = clamp_move(objs, d, d)
@@ -516,6 +545,47 @@ class App:
         self.set_tool("select")
         self.set_selection(sids)
         self.flash(f"已貼上 {len(sids)} 個物件")
+
+    # ====================== 右鍵選單 ======================
+    def on_context(self, e):
+        if self.drag:
+            return "break"
+        self.commit_editor()
+        self.canvas.focus_set()
+        sid = self.hit(e.x, e.y)
+        inside = self.sel_bbox and (self.sel_bbox[0] <= e.x <= self.sel_bbox[2]
+                                    and self.sel_bbox[1] <= e.y <= self.sel_bbox[3])
+        if sid and sid not in self.selection:         # 右鍵點到物件：選取它
+            self.set_tool("select")
+            self.set_selection({sid})
+        elif not sid and not inside:                  # 點到空白處：取消選取
+            self.set_selection(())
+        at = self.to_norm(e.x, e.y)
+        has_sel = bool(self.selection)
+        can_paste = self.read_clipboard() is not None
+        one_text = (len(self.selection) == 1
+                    and is_text(self.strokes[next(iter(self.selection))]))
+        on = lambda ok: tk.NORMAL if ok else tk.DISABLED  # noqa: E731
+        m, mod = self.menu, self.mod_label
+        m.delete(0, "end")
+        m.add_command(label="複製", accelerator=f"{mod}+C", command=self.copy, state=on(has_sel))
+        m.add_command(label="剪下", accelerator=f"{mod}+X", command=self.cut, state=on(has_sel))
+        m.add_command(label="貼上", accelerator=f"{mod}+V", command=lambda: self.paste(at=at),
+                      state=on(can_paste))
+        m.add_command(label="刪除", accelerator="Del", command=self.delete_selection,
+                      state=on(has_sel))
+        m.add_separator()
+        if one_text:
+            tsid = next(iter(self.selection))
+            m.add_command(label="編輯文字", command=lambda: self.open_editor(sid=tsid))
+        m.add_command(label="全選", accelerator=f"{mod}+A", command=self.select_all,
+                      state=on(bool(self.strokes)))
+        m.add_command(label="復原", accelerator=f"{mod}+Z", command=self.undo)
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+        return "break"
 
     def add_objects(self, objs):
         """把物件當成自己新增的送給伺服器 (貼上 / 開啟檔案共用；之後可用復原撤銷)。"""

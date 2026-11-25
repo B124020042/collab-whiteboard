@@ -59,6 +59,7 @@ class Tk(Widget):
     def __init__(self):
         super().__init__(None)
         self.root, self.focused, self.clipboard = self, None, None
+        self.tk = types.SimpleNamespace(call=lambda *a: "x11")
 
     def title(self, t): pass
     def geometry(self, g): pass
@@ -72,6 +73,27 @@ class Tk(Widget):
         if not self.clipboard:
             raise TclError("empty")
         return self.clipboard
+
+
+class Menu(Widget):
+    def __init__(self, master=None, **kw):
+        super().__init__(master, **kw)
+        self.entries, self.popped = [], None
+
+    def delete(self, a, b=None): self.entries = []
+    def add_command(self, **kw): self.entries.append(kw)
+    def add_separator(self): self.entries.append({"label": "---"})
+    def tk_popup(self, x, y): self.popped = (x, y)
+    def grab_release(self): pass
+
+    # 測試輔助
+    def item(self, label):
+        return next((e for e in self.entries if e["label"] == label), None)
+
+    def click(self, label):
+        e = self.item(label)
+        assert e and e.get("state", "normal") == "normal", f"{label} 無法點選"
+        e["command"]()
 
 
 class Text(Widget):
@@ -185,12 +207,12 @@ class Canvas(Widget):
 
 def install_fake_tk():
     tk = types.ModuleType("tkinter")
-    for name, val in dict(Tk=Tk, Canvas=Canvas, Text=Text, Frame=Widget, Button=Widget,
+    for name, val in dict(Tk=Tk, Canvas=Canvas, Text=Text, Menu=Menu, Frame=Widget, Button=Widget,
                           Label=Widget, Scale=Widget, Spinbox=Widget, Entry=Widget,
                           IntVar=Var, StringVar=Var, TclError=TclError).items():
         setattr(tk, name, val)
     for c in ("LEFT", "RIGHT", "TOP", "BOTTOM", "X", "BOTH", "RAISED", "SUNKEN",
-              "SOLID", "ROUND", "HORIZONTAL"):
+              "SOLID", "ROUND", "HORIZONTAL", "NORMAL", "DISABLED"):
         setattr(tk, c, c.lower())
     tk.Spinbox = type("Spinbox", (Widget,), {})
     tk.Entry = type("Entry", (Widget,), {})
@@ -223,7 +245,7 @@ import client  # noqa: E402  (必須在安裝假 tkinter 之後才匯入)
 
 
 def ev(x, y, shift=False):
-    return types.SimpleNamespace(x=x, y=y, state=1 if shift else 0)
+    return types.SimpleNamespace(x=x, y=y, x_root=x + 50, y_root=y + 80, state=1 if shift else 0)
 
 
 class Board:
@@ -419,6 +441,68 @@ class ClientTest(unittest.TestCase):
         self.b.wait(lambda: B.strokes[sid]["size"] < 20)
         self.assertGreaterEqual(B.strokes[sid]["size"], 6)
         self.assertEqual(B.strokes[sid], A.strokes[sid])
+
+    def test_context_menu(self):
+        A, B = self.a.app, self.b.app
+        menu = A.menu
+        self.a.drag([(100, 100), (200, 100)])
+        A.set_tool("text")
+        A.on_press(ev(400, 300)); A.editor["w"].type("右鍵"); A.commit_editor()
+        self.b.wait(lambda: len(B.strokes) == 2)
+        line, txt = list(A.strokes)
+        self.a.root.clipboard = None
+        A.clip = None
+
+        # 空白處按右鍵：沒有選取、剪貼簿空 -> 複製/剪下/刪除/貼上都不能按
+        A.set_tool("pen")
+        A.on_context(ev(800, 500))
+        self.assertEqual(menu.popped, (850, 580))             # 選單出現在滑鼠位置
+        for label in ("複製", "剪下", "貼上", "刪除"):
+            self.assertEqual(menu.item(label)["state"], "disabled")
+        self.assertIsNone(menu.item("編輯文字"))
+
+        # 在線條上按右鍵：自動切到選取工具並選取它，可以複製
+        A.on_context(ev(150, 100))
+        self.assertEqual((A.tool, A.selection), ("select", {line}))
+        menu.click("複製")
+        # 在空白處按右鍵 -> 貼上到按右鍵的位置
+        A.on_context(ev(600, 450))
+        self.assertFalse(A.selection)
+        menu.click("貼上")
+        self.b.wait(lambda: len(B.strokes) == 3)
+        new = next(s for s in B.strokes if s not in (line, txt))
+        self.assertEqual(B.strokes[new]["pts"][0], [0.6, 0.75])
+        self.assertEqual(A.selection, {new})                  # 貼上後選取新物件
+
+        # 文字上按右鍵 -> 有「編輯文字」；刪除
+        A.on_context(ev(405, 305))
+        self.assertEqual(A.selection, {txt})
+        menu.click("編輯文字")
+        self.assertEqual(A.editor["sid"], txt)
+        A.commit_editor(cancel=True)
+        A.on_context(ev(405, 305))
+        menu.click("刪除")
+        self.b.wait(lambda: txt not in B.strokes)
+
+        # 多選後在選取範圍內 (物件之間的空白) 按右鍵，不會取消選取；剪下
+        A.select_all()
+        self.assertEqual(len(A.selection), 2)
+        x0, y0, x1, y1 = A.sel_bbox
+        A.on_context(ev(x0 + 1, y1 - 1))
+        self.assertEqual(len(A.selection), 2)
+        menu.click("剪下")
+        self.b.wait(lambda: not B.strokes)
+        A.on_context(ev(10, 10))
+        self.assertEqual(menu.item("貼上")["state"], "normal")
+        self.assertEqual(menu.item("全選")["state"], "disabled")
+
+        # 剪貼簿是一般文字 -> 貼上成文字框，位置就是按右鍵的地方
+        self.a.root.clipboard = "外面複製的字"
+        A.on_context(ev(300, 120))
+        menu.click("貼上")
+        self.b.wait(lambda: self.texts(self.b) == ["外面複製的字"])
+        o = next(iter(B.strokes.values()))
+        self.assertEqual((o["x"], o["y"]), (0.3, 0.2))
 
     def test_band_select(self):
         A = self.a.app
