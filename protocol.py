@@ -10,6 +10,7 @@ client -> server
   {"type":"draw",   "sid", "color":"#rrggbb", "width":int, "pts":[[x,y],...]}  # 新增/接續筆跡
   {"type":"text",   "sid", "x", "y", "text", "color", "size"}               # 新增/修改文字
   {"type":"move",   "sids":[...], "dx", "dy"}                               # 移動物件
+  {"type":"scale",  "sids":[...], "ox", "oy", "sx", "sy"}                   # 以 (ox,oy) 為基準縮放
   {"type":"delete", "sids":[...]}                                           # 刪除物件
   {"type":"cursor", "x", "y"}
   {"type":"undo"}                      # 移除自己最後新增的物件
@@ -21,17 +22,21 @@ server -> client
   {"type":"draw",      "sid", "owner", "color", "width", "pts"}
   {"type":"text",      "sid", "owner", "kind", "x", "y", "text", "color", "size"}
   {"type":"move",      "sids", "dx", "dy"}
+  {"type":"scale",     "sids", "ox", "oy", "sx", "sy"}
   {"type":"cursor",    "name", "x", "y"}
   {"type":"remove",    "sid"}          {"type":"clear", "by"}
   {"type":"error",     "text"}
 """
 import json
+import math
 import re
 
 DEFAULT_PORT = 9100
 MAX_PTS_PER_MSG = 500          # 單一 draw 訊息最多幾個點
 MAX_TEXT = 1000                # 文字框最多字數
 MIN_FONT, MAX_FONT = 6, 120
+MAX_WIDTH = 60
+MIN_SCALE, MAX_SCALE = 0.05, 20.0
 FILE_VERSION = 2
 APP_ID = "collab-whiteboard"
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -49,6 +54,11 @@ def decode(line):
 
 def clamp01(v):
     return min(1.0, max(0.0, float(v)))
+
+
+def q(v):
+    """座標統一取到小數 4 位並限制在 0~1 (伺服器與客戶端都用，結果一致)。"""
+    return round(clamp01(v), 4)
 
 
 def valid_color(c):
@@ -86,10 +96,46 @@ def clamp_move(objs, dx, dy):
 
 def move_obj(o, dx, dy):
     if is_text(o):
-        o["x"] = clamp01(o["x"] + dx)
-        o["y"] = clamp01(o["y"] + dy)
+        o["x"] = q(o["x"] + dx)
+        o["y"] = q(o["y"] + dy)
     else:
-        o["pts"] = [[clamp01(x + dx), clamp01(y + dy)] for x, y in o["pts"]]
+        o["pts"] = [[q(x + dx), q(y + dy)] for x, y in o["pts"]]
+
+
+# ---------- 縮放 (同樣由伺服器與客戶端共用) ----------
+def clamp_scale(objs, ox, oy, sx, sy, keep_ratio=False):
+    """限制縮放倍率：不可翻轉、不可小於 MIN_SCALE，且縮放後不能超出畫布。"""
+    ox, oy = clamp01(ox), clamp01(oy)
+    sx = min(MAX_SCALE, max(MIN_SCALE, float(sx)))
+    sy = min(MAX_SCALE, max(MIN_SCALE, float(sy)))
+    bb = objects_bbox(objs)
+    if bb is None:
+        return ox, oy, 1.0, 1.0
+    minx, miny, maxx, maxy = bb
+
+    def limit(s, lo, hi, o):
+        if hi > o:
+            s = min(s, (1.0 - o) / (hi - o))
+        if lo < o:
+            s = min(s, o / (o - lo))
+        return max(1e-3, s)
+
+    sx, sy = limit(sx, minx, maxx, ox), limit(sy, miny, maxy, oy)
+    if keep_ratio:
+        sx = sy = min(sx, sy)
+    return ox, oy, sx, sy
+
+
+def scale_obj(o, ox, oy, sx, sy):
+    """以 (ox, oy) 為基準縮放；筆跡粗細與文字字級依面積比例 sqrt(sx*sy) 調整。"""
+    f = math.sqrt(sx * sy)
+    if is_text(o):
+        o["x"] = q(ox + (o["x"] - ox) * sx)
+        o["y"] = q(oy + (o["y"] - oy) * sy)
+        o["size"] = min(MAX_FONT, max(MIN_FONT, round(o["size"] * f)))
+    else:
+        o["pts"] = [[q(ox + (x - ox) * sx), q(oy + (y - oy) * sy)] for x, y in o["pts"]]
+        o["width"] = min(MAX_WIDTH, max(1, round(o["width"] * f)))
 
 
 # ---------- 存檔 / 讀檔 (.json，也用於剪貼簿) ----------

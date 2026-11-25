@@ -12,7 +12,8 @@ import re
 from collections import OrderedDict
 
 from protocol import (DEFAULT_PORT, MAX_FONT, MAX_PTS_PER_MSG, MAX_TEXT, MIN_FONT, clamp01,
-                      clamp_move, decode, encode, is_text, move_obj, valid_color)
+                      clamp_move, clamp_scale, decode, encode, is_text, move_obj, scale_obj,
+                      valid_color)
 
 MAX_NAME = 16
 MAX_ROOM = 20
@@ -108,6 +109,18 @@ class WhiteboardServer:
                 for o in objs:
                     move_obj(o, dx, dy)
                 await self.broadcast(room, exclude=c, type="move", sids=sids, dx=dx, dy=dy)
+        elif t == "scale":
+            sids = [sid for sid in self.sid_list(msg) if sid in room.strokes]
+            try:
+                objs = [room.strokes[sid] for sid in sids]
+                ox, oy, sx, sy = clamp_scale(objs, msg["ox"], msg["oy"], msg["sx"], msg["sy"])
+            except (KeyError, TypeError, ValueError):
+                return
+            if sids and (sx != 1 or sy != 1):
+                for o in objs:
+                    scale_obj(o, ox, oy, sx, sy)
+                await self.broadcast(room, exclude=c, type="scale", sids=sids,
+                                     ox=ox, oy=oy, sx=sx, sy=sy)
         elif t == "cursor":
             try:
                 x, y = clamp01(msg["x"]), clamp01(msg["y"])

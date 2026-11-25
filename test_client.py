@@ -358,6 +358,68 @@ class ClientTest(unittest.TestCase):
         A.delete_selection()
         self.b.wait(lambda: list(B.strokes) == [s2])
 
+    def handle_xy(self, board, name):
+        return board.app.handle_points(board.app.sel_bbox)[name]
+
+    def test_resize_corner_keeps_ratio(self):
+        A, B = self.a.app, self.b.app
+        self.a.drag([(100, 100), (200, 100), (200, 160)])   # L 形線條，寬 4
+        self.b.wait(lambda: B.strokes)
+        sid = next(iter(A.strokes))
+        A.set_tool("select")
+        A.on_press(ev(150, 100)); A.on_release(ev(150, 100))
+        self.assertIsNotNone(A.sel_bbox)
+        self.assertEqual(len(A.canvas.find("handle")), 8)    # 8 個控制點
+        hx, hy = self.handle_xy(self.a, "se")
+        ox, oy = A.sel_bbox[0], A.sel_bbox[1]
+        self.a.drag([(hx, hy), (ox + (hx - ox) * 2, oy + (hy - oy) * 1.2)])  # 往右下拉
+        self.b.wait(lambda: B.strokes[sid]["width"] == 8)    # 等比例放大 2 倍，粗細 4 -> 8
+        pa, pb = A.strokes[sid]["pts"], B.strokes[sid]["pts"]
+        self.assertEqual(pa, pb)                              # 兩邊結果完全一致
+        w = (pa[1][0] - pa[0][0]) * 1000
+        h = (pa[2][1] - pa[1][1]) * 600
+        self.assertAlmostEqual(w / h, 100 / 60, places=2)     # 維持長寬比
+        self.assertAlmostEqual(w, 200, delta=1)
+        self.assertEqual(A.selection, {sid})                  # 縮放後仍保持選取
+
+    def test_resize_shift_and_edge(self):
+        A, B = self.a.app, self.b.app
+        self.a.drag([(100, 100), (200, 200)])
+        self.b.wait(lambda: B.strokes)
+        sid = next(iter(A.strokes))
+        A.set_tool("select"); A.set_selection({sid})
+        x0, y0, x1, y1 = A.sel_bbox
+        hx, hy = self.handle_xy(self.a, "se")
+        self.a.drag([(hx, hy), (x0 + (hx - x0) * 2, hy)], shift=True)   # Shift：只拉寬
+        self.b.wait(lambda: B.strokes[sid]["pts"] == A.strokes[sid]["pts"]
+                    and B.strokes[sid]["pts"][1][0] > 0.25)
+        (ax, ay), (bx, by) = A.strokes[sid]["pts"]
+        self.assertAlmostEqual((by - ay) * 600, 100, delta=1)  # 高度不變
+        self.assertGreater((bx - ax) * 1000, 190)
+        hx, hy = self.handle_xy(self.a, "n")                 # 上方邊：只改高度
+        self.a.drag([(hx, hy), (hx + 300, hy - 50)])
+        self.b.wait(lambda: B.strokes[sid]["pts"] == A.strokes[sid]["pts"]
+                    and B.strokes[sid]["pts"][0][1] < ay - 0.05)
+        self.assertAlmostEqual(A.strokes[sid]["pts"][0][0], ax, places=4)  # x 不變
+
+    def test_resize_text_and_limits(self):
+        A, B = self.a.app, self.b.app
+        A.set_tool("text")
+        A.on_press(ev(800, 400)); A.editor["w"].type("大字"); A.commit_editor()
+        self.b.wait(lambda: B.strokes)
+        sid = next(iter(A.strokes))
+        A.set_tool("select"); A.set_selection({sid})
+        hx, hy = self.handle_xy(self.a, "se")
+        self.a.drag([(hx, hy), (hx + 5000, hy + 5000)])     # 拉到超出畫布
+        self.b.wait(lambda: B.strokes[sid]["size"] > 20)
+        self.assertEqual(B.strokes[sid], A.strokes[sid])
+        self.assertLessEqual(B.strokes[sid]["x"], 1.0)
+        hx, hy = self.handle_xy(self.a, "se")
+        self.a.drag([(hx, hy), (0, 0)])                      # 縮到最小，不會翻轉或消失
+        self.b.wait(lambda: B.strokes[sid]["size"] < 20)
+        self.assertGreaterEqual(B.strokes[sid]["size"], 6)
+        self.assertEqual(B.strokes[sid], A.strokes[sid])
+
     def test_band_select(self):
         A = self.a.app
         self.a.drag([(100, 100), (120, 110)])

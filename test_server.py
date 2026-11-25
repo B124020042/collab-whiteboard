@@ -220,6 +220,24 @@ class WhiteboardTest(unittest.TestCase):
         self.assertEqual(b.until("remove")["sid"], "t3")
         a.close(); b.close()
 
+    def test_scale(self):
+        a, b = C("amy", "scale"), C("ben", "scale")
+        a.send(type="draw", sid="s", width=4, pts=[[0.2, 0.2], [0.4, 0.3]])
+        a.send(type="text", sid="t", x=0.3, y=0.25, text="字", color="#000000", size=20)
+        b.until("text")
+        b.send(type="scale", sids=["s", "t", "x"], ox=0.2, oy=0.2, sx=2, sy=2)
+        m = a.until("scale")
+        self.assertEqual((m["sids"], m["sx"], m["sy"]), (["s", "t"], 2.0, 2.0))
+        st = {o["sid"]: o for o in C("v", "scale").welcome["strokes"]}
+        self.assertEqual(st["s"]["pts"], [[0.2, 0.2], [0.6, 0.4]])
+        self.assertEqual((st["s"]["width"], st["t"]["size"]), (8, 40))
+        self.assertAlmostEqual(st["t"]["x"], 0.4)
+        b.send(type="scale", sids=["s"], ox=0.2, oy=0.2, sx=100, sy=-3)   # 超出畫布 / 翻轉
+        m = a.until("scale")
+        self.assertAlmostEqual(m["sx"], 2.0)                 # 0.2 + 0.4*2 = 1.0 剛好到邊
+        self.assertAlmostEqual(m["sy"], 0.05)                # 不可翻轉，最小 0.05
+        a.close(); b.close()
+
 
 class FileFormatTest(unittest.TestCase):
     def test_parse_board(self):

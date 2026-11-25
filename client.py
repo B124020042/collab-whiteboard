@@ -21,7 +21,8 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
 from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
-                      decode, dump_board, encode, is_text, move_obj, parse_board)
+                      clamp_scale, decode, dump_board, encode, is_text, move_obj, parse_board,
+                      scale_obj)
 
 BG = "#ffffff"
 PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
@@ -99,6 +100,11 @@ def user_color(name):
 TOOLS = [("pen", "畫筆 (P)", "crosshair"), ("eraser", "橡皮擦 (E)", "circle"),
          ("text", "文字 (T)", "xterm"), ("select", "選取 (V)", "arrow")]
 SEL_COLOR = "#1e88e5"
+HANDLE_SIZE = 9
+MIN_SEL_BOX = 24          # 選取框最小邊長 (像素)，避免控制點蓋住細線
+HANDLE_CURSORS = {"nw": "top_left_corner", "ne": "top_right_corner", "sw": "bottom_left_corner",
+                  "se": "bottom_right_corner", "n": "sb_v_double_arrow", "s": "sb_v_double_arrow",
+                  "e": "sb_h_double_arrow", "w": "sb_h_double_arrow"}
 PASTE_OFFSET = 0.02
 
 
@@ -130,6 +136,7 @@ class App:
         self.resize_job = None
         self.pending_load = None   # 「清除後載入」：等伺服器確認清除後再載入
         self.selection = set()     # 已選取的 sid
+        self.sel_bbox = None       # 選取範圍的整體外框 (像素)
         self.drag = None           # 選取工具的拖曳狀態 (移動 / 框選)
         self.editor = None         # 文字編輯框狀態
         self.clip = None           # 內部剪貼簿 (系統剪貼簿無法使用時的備援)
@@ -268,8 +275,9 @@ class App:
         return max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
 
     def to_norm(self, x, y):
+        """像素 -> 比例座標 (取到小數 4 位，與送給伺服器的值一致)。"""
         w, h = self.size()
-        return [min(1.0, max(0.0, x / w)), min(1.0, max(0.0, y / h))]
+        return [round(min(1.0, max(0.0, x / w)), 4), round(min(1.0, max(0.0, y / h)), 4)]
 
     def to_px(self, p):
         w, h = self.size()
@@ -335,14 +343,94 @@ class App:
         self.refresh_sel()
 
     def refresh_sel(self):
+        """畫出每個已選物件的虛線框，以及整體外框的 8 個縮放控制點。"""
         self.canvas.delete("selbox")
+        boxes = []
         for sid in self.selection:
             bb = self.canvas.bbox("s_" + sid)
             if bb:
+                boxes.append(bb)
                 x0, y0, x1, y1 = bb
                 self.canvas.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline=SEL_COLOR,
                                              dash=(4, 3), tags=("selbox",))
+        self.sel_bbox = None
+        if boxes and self.tool == "select":
+            x0, y0 = min(b[0] for b in boxes) - 3, min(b[1] for b in boxes) - 3
+            x1, y1 = max(b[2] for b in boxes) + 3, max(b[3] for b in boxes) + 3
+            if x1 - x0 < MIN_SEL_BOX:
+                xm = (x0 + x1) / 2
+                x0, x1 = xm - MIN_SEL_BOX / 2, xm + MIN_SEL_BOX / 2
+            if y1 - y0 < MIN_SEL_BOX:
+                ym = (y0 + y1) / 2
+                y0, y1 = ym - MIN_SEL_BOX / 2, ym + MIN_SEL_BOX / 2
+            self.sel_bbox = (x0, y0, x1, y1)
+            if len(boxes) > 1:
+                self.canvas.create_rectangle(x0, y0, x1, y1, outline=SEL_COLOR,
+                                             tags=("selbox",))
+            r = HANDLE_SIZE / 2
+            for name, (hx, hy) in self.handle_points(self.sel_bbox).items():
+                self.canvas.create_rectangle(hx - r, hy - r, hx + r, hy + r, fill="white",
+                                             outline=SEL_COLOR, width=1.5,
+                                             tags=("selbox", "handle", "h_" + name))
         self.canvas.tag_raise("cursor")
+
+    @staticmethod
+    def handle_points(bb):
+        x0, y0, x1, y1 = bb
+        xm, ym = (x0 + x1) / 2, (y0 + y1) / 2
+        return {"nw": (x0, y0), "n": (xm, y0), "ne": (x1, y0), "e": (x1, ym),
+                "se": (x1, y1), "s": (xm, y1), "sw": (x0, y1), "w": (x0, ym)}
+
+    def hit_handle(self, x, y):
+        for item in reversed(self.canvas.find_overlapping(x - 1, y - 1, x + 1, y + 1)):
+            for tag in self.canvas.gettags(item):
+                if tag.startswith("h_"):
+                    return tag[2:]
+        return None
+
+    def start_scale(self, e, handle):
+        """拖曳控制點：記下原始物件，之後每次移動都從原始狀態重新計算 (避免誤差累積)。"""
+        x0, y0, x1, y1 = self.sel_bbox
+        ox = {"w": x1, "nw": x1, "sw": x1, "e": x0, "ne": x0, "se": x0}.get(handle)  # 對邊為基準
+        oy = {"n": y1, "nw": y1, "ne": y1, "s": y0, "sw": y0, "se": y0}.get(handle)
+        hx, hy = self.handle_points(self.sel_bbox)[handle]
+        sids = self.ordered(self.selection)
+        self.drag = {"mode": "scale", "handle": handle, "sids": sids,
+                     "orig": {s: json.loads(json.dumps(self.strokes[s])) for s in sids},
+                     "ox": ox, "oy": oy, "hx": hx, "hy": hy, "params": None}
+
+    def update_scale(self, e):
+        d = self.drag
+        w, h = self.size()
+        corner = d["ox"] is not None and d["oy"] is not None
+        sx = (e.x - d["ox"]) / (d["hx"] - d["ox"]) if d["ox"] is not None else 1.0
+        sy = (e.y - d["oy"]) / (d["hy"] - d["oy"]) if d["oy"] is not None else 1.0
+        keep = corner and not (e.state & 0x0001)       # 角落預設等比例，按 Shift 自由縮放
+        if keep:
+            sx = sy = max(sx, sy)
+        ox = d["ox"] / w if d["ox"] is not None else 0.0
+        oy = d["oy"] / h if d["oy"] is not None else 0.0
+        objs = [d["orig"][s] for s in d["sids"]]
+        ox, oy, sx, sy = clamp_scale(objs, ox, oy, sx, sy, keep_ratio=keep)
+        # 四捨五入後再用伺服器同樣的規則檢查一次，確保伺服器算出的結果與本機完全相同
+        params = clamp_scale(objs, *(round(v, 5) for v in (ox, oy, sx, sy)))
+        d["params"] = params
+        for s in d["sids"]:
+            if s in self.strokes:
+                o = json.loads(json.dumps(d["orig"][s]))
+                scale_obj(o, *params)
+                self.strokes[s] = o
+                self.redraw_obj(s)
+        self.refresh_sel()
+        self.flash(f"縮放 {params[2] * 100:.0f}% × {params[3] * 100:.0f}%")
+
+    def finish_scale(self, d):
+        p = d["params"]
+        sids = [s for s in d["sids"] if s in self.strokes]
+        if p and sids and (p[2] != 1 or p[3] != 1):    # 放開滑鼠才送出一次 scale
+            ox, oy, sx, sy = p
+            self.net.send(type="scale", sids=sids, ox=ox, oy=oy, sx=sx, sy=sy)
+        self.refresh_sel()
 
     def ordered(self, sids):
         """依畫布上的先後順序 (下層到上層) 排列。"""
@@ -524,6 +612,10 @@ class App:
             sid = self.hit(e.x, e.y, text_only=True)
             self.open_editor(sid=sid) if sid else self.open_editor(px=e.x, py=e.y)
         elif self.tool == "select":
+            handle = self.hit_handle(e.x, e.y) if self.sel_bbox else None
+            if handle:                     # 點到控制點：開始縮放
+                self.start_scale(e, handle)
+                return
             sid = self.hit(e.x, e.y)
             shift = bool(e.state & 0x0001)
             if sid and shift:              # Shift+點擊：加選 / 取消選取
@@ -547,6 +639,9 @@ class App:
             d = self.drag
             if not d:
                 return
+            if d["mode"] == "scale":
+                self.update_scale(e)
+                return
             if d["mode"] == "move":
                 w, h = self.size()
                 objs = [self.strokes[s] for s in d["sids"] if s in self.strokes]
@@ -565,6 +660,9 @@ class App:
     def on_release(self, e):
         if self.tool == "select" and self.drag:
             d, self.drag = self.drag, None
+            if d["mode"] == "scale":
+                self.finish_scale(d)
+                return
             if d["mode"] == "move":
                 dx, dy = round(d["applied"][0], 5), round(d["applied"][1], 5)
                 sids = [s for s in d["sids"] if s in self.strokes]
@@ -600,6 +698,9 @@ class App:
 
     def on_move(self, e):
         self.mouse = self.to_norm(e.x, e.y)
+        if self.tool == "select" and not self.drag:   # 滑到控制點上換成縮放游標
+            handle = self.hit_handle(e.x, e.y) if self.sel_bbox else None
+            self.canvas.config(cursor=HANDLE_CURSORS[handle] if handle else "arrow")
         now = time.monotonic()
         if now - self.last_cursor_t >= CURSOR_INTERVAL:
             self.last_cursor_t = now
@@ -801,6 +902,8 @@ class App:
             for sid in m["sids"]:
                 if sid in self.strokes:
                     move_obj(self.strokes[sid], m["dx"], m["dy"])
+                    if self.drag and self.drag["mode"] == "scale" and sid in self.drag["orig"]:
+                        move_obj(self.drag["orig"][sid], m["dx"], m["dy"])
                     if sid in dragging:    # 我正在拖曳的物件被別人移動：以模型為準重畫
                         self.redraw_obj(sid)
                         self.canvas.move("s_" + sid, *(v * s for v, s in
@@ -811,6 +914,15 @@ class App:
                 o = self.strokes[self.editor["sid"]]
                 self.editor["pos"] = [o["x"], o["y"]]
                 self.canvas.coords(self.editor["item"], *self.to_px(self.editor["pos"]))
+            self.refresh_sel()
+        elif t == "scale":
+            p = (m["ox"], m["oy"], m["sx"], m["sy"])
+            for sid in m["sids"]:
+                if sid in self.strokes:
+                    scale_obj(self.strokes[sid], *p)
+                    self.redraw_obj(sid)
+                    if self.drag and self.drag["mode"] == "scale" and sid in self.drag["orig"]:
+                        scale_obj(self.drag["orig"][sid], *p)   # 我正在縮放時別人也縮放了
             self.refresh_sel()
         elif t == "remove":
             self.strokes.pop(m["sid"], None)
