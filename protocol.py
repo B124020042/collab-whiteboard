@@ -14,6 +14,10 @@ client -> server
   {"type":"delete", "sids":[...]}                                           # 刪除物件
   {"type":"cursor", "x", "y"}
   {"type":"ping"}                      # 探測伺服器 (不需先 hello)，回覆 pong
+  {"type":"create_room"}               # (線上) 建立新房間，回覆 room_created
+  {"type":"room_info", "room"}         # (線上) 查詢房間是否存在，回覆 room_info
+  {"type":"restore", "strokes":[...]}  # 伺服器重啟後房間是空的：把本機畫面傳回去復原
+  {"type":"heartbeat"}                 # 心跳 (避免雲端平台判定閒置而休眠)
   {"type":"undo"}                      # 移除自己最後新增的物件
   {"type":"clear"}                     # 清空整個房間畫布
 
@@ -27,6 +31,8 @@ server -> client
   {"type":"cursor",    "name", "x", "y"}
   {"type":"remove",    "sid"}          {"type":"clear", "by"}
   {"type":"pong",      "app", "port", "users", "rooms":{房間: 人數}, "host"}
+  {"type":"room_created", "code"}      {"type":"room_info", "room", "exists", "users"}
+  {"type":"reset",     "strokes", "by"}   # 畫面被整個復原 (等同重新 welcome)
   {"type":"error",     "text"}
 
 自動探索 (UDP)：客戶端廣播 DISCOVER_MAGIC 到 DISCOVERY_PORT，伺服器回傳一個 pong JSON。
@@ -170,6 +176,24 @@ def dump_board(objs) -> dict:
     return {"app": APP_ID, "version": FILE_VERSION, "strokes": out}
 
 
+def clean_obj(s):
+    """驗證並整理一個物件 (筆跡或文字)；不合法回傳 None。不含 sid / owner。"""
+    try:
+        color = valid_color(s.get("color"))
+        if s.get("kind") == "text":
+            text = str(s["text"])[:MAX_TEXT]
+            if not text.strip():
+                return None
+            return {"kind": "text", "x": clamp01(s["x"]), "y": clamp01(s["y"]), "text": text,
+                    "color": color,
+                    "size": min(MAX_FONT, max(MIN_FONT, int(s.get("size", 20))))}
+        width = min(MAX_WIDTH, max(1, int(s.get("width", 3))))
+        pts = [[clamp01(p[0]), clamp01(p[1])] for p in s["pts"]]
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return None
+    return {"color": color, "width": width, "pts": pts} if pts else None
+
+
 def parse_board(data) -> list:
     """驗證並讀取存檔內容 (接受 dump_board 格式或單純的物件陣列)。
 
@@ -179,24 +203,7 @@ def parse_board(data) -> list:
         data = data.get("strokes")
     if not isinstance(data, list):
         raise ValueError("不是白板存檔格式")
-    out = []
-    for s in data:
-        try:
-            color = valid_color(s.get("color"))
-            if s.get("kind") == "text":
-                text = str(s["text"])[:MAX_TEXT]
-                if not text.strip():
-                    continue
-                out.append({"kind": "text", "x": clamp01(s["x"]), "y": clamp01(s["y"]),
-                            "text": text, "color": color,
-                            "size": min(MAX_FONT, max(MIN_FONT, int(s.get("size", 20))))})
-                continue
-            width = min(60, max(1, int(s.get("width", 3))))
-            pts = [[clamp01(p[0]), clamp01(p[1])] for p in s["pts"]]
-        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
-            continue                     # 跳過壞掉的物件
-        if pts:
-            out.append({"color": color, "width": width, "pts": pts})
+    out = [o for o in (clean_obj(s) for s in data if isinstance(s, dict)) if o]
     if data and not out:
         raise ValueError("檔案裡沒有可讀取的內容")
     return out

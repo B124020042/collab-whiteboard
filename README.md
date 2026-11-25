@@ -20,7 +20,9 @@
 - **線上名單**、加入 / 離開通知、暱稱重複自動加編號
 - **後加入者自動補齊畫面**：伺服器保存筆跡，新連線會收到完整重播
 - **斷線自動重連**：網路恢復後自動重新連線並同步到最新畫面
-- **房間號** (`start.py`)：第一個人建立房間取得房間號，其他人輸入房間號即可加入；也保留自動尋找區網伺服器的模式
+- **線上使用**：伺服器可部署到雲端 (Render 免費方案)，不同網路、不同地方的人輸入房間號就能一起畫
+- **房間號** (`start.py`)：第一個人建立房間取得房間號，其他人輸入房間號即可加入；沒有雲端時也能在同一個區網使用
+- **伺服器重啟自動復原**：雲端伺服器休眠或更新後，客戶端自動重連並把畫面傳回去，大家的畫面不會消失
 - **Demo 機器人** (`bot.py`)：自動畫玫瑰線 / 螺旋，單人也能展示多人協作
 
 ## 執行方式
@@ -28,7 +30,42 @@
 需要 Python 3.8 以上。tkinter 通常已內建；若出現 `No module named 'tkinter'`：
 Ubuntu/Debian 執行 `sudo apt install python3-tk`，macOS (Homebrew) 執行 `brew install python-tk`。
 
-### 最簡單：建立房間 / 輸入房間號加入 (推薦)
+### 線上使用 (不同網路也能連，推薦)
+
+**只要做一次：把伺服器部署到 Render (免費、不用信用卡)**
+
+1. 到 [render.com](https://render.com) 用 GitHub 帳號登入。
+2. 點 **New + → Blueprint**，選這個 repo (`collab-whiteboard`)，按 **Apply**。設定都寫在 `render.yaml` (免費方案、`python server.py --public`)。
+   - 也可以用 **New + → Web Service** 手動建立：Runtime 選 Python，Build Command `pip install -r requirements.txt`，Start Command `python server.py --public`，Instance Type 選 **Free**。
+3. 部署完成後，頁面上方會有網址，例如 `https://collab-whiteboard-xxxx.onrender.com`。用瀏覽器打開看到 `collab-whiteboard server OK` 就成功了。
+4. 把網址的 `https://` 改成 `wss://`，填進 repo 裡的 `config.json`，然後 commit / push，大家 `git pull`：
+
+   ```json
+   { "server": "wss://collab-whiteboard-xxxx.onrender.com" }
+   ```
+
+**之後每次使用**
+
+```bash
+python3 start.py
+```
+
+- 第一個人按「建立房間」，取得 5 碼房間號 (例如 `K7Q2M`)，白板上方可一鍵複製。
+- 其他人輸入房間號按「加入房間」。在哪裡、用什麼網路都可以。
+
+**免費方案的限制**
+
+- 15 分鐘沒有任何人使用，伺服器會休眠；下一次連線要等約 1 分鐘喚醒 (視窗會顯示「伺服器休眠時第一次約需 1 分鐘」)。只要還有人開著白板，客戶端每 25 秒送一次心跳，就不會休眠。
+- 伺服器休眠或重新部署後，記憶體裡的房間會清空：
+  - 還開著白板的人重新連上時，會自動把畫面傳回伺服器復原，不用做任何事。
+  - 如果大家都關掉了，房間號就失效，要重新建立房間。想保留畫面請先「儲存」成 `.json`，之後「開啟」即可。
+
+指令版：`python3 start.py create`、`python3 start.py join K7Q2M`；暫時不想用線上時加 `--lan`。
+沒有修改 `config.json` 也可以用 `--server wss://...` 或環境變數 `WHITEBOARD_SERVER` 指定伺服器。
+
+> macOS 若出現「SSL 憑證驗證失敗」：執行「應用程式 → Python 3.x → Install Certificates.command」。
+
+### 同一個區網：建立房間 / 輸入房間號加入
 
 ```bash
 python3 start.py
@@ -88,6 +125,7 @@ python3 test_server.py     # 伺服器與通訊協定
 python3 test_client.py     # 客戶端邏輯
 python3 test_start.py      # 建立 / 加入房間、自動探索
 python3 test_roomcode.py   # 房間號編碼
+python3 test_online.py     # WebSocket、線上房間、伺服器重啟復原
 ```
 
 ### 操作說明
@@ -148,9 +186,11 @@ TCP 之上自訂應用層協定：每則訊息是一行 UTF-8 JSON，以 `\n` �
 8. **縮放同步**：送出的是「基準點 + 倍率」而非每個點的新座標，封包很小。拖曳中每次都從按下時的原始狀態重新計算 (誤差不累積)，放開才送出；倍率限制 (不翻轉、不超出畫布) 與座標取 4 位小數都由 `protocol.py` 的共用函式處理，所以每台電腦的結果完全一致。
 9. **剪貼簿**：複製時把物件以存檔格式 (JSON) 放進系統剪貼簿，所以能貼到另一個視窗；貼上時先判斷是否為白板資料，否則當成純文字建立文字框。
 10. **存檔格式**：`.json` 存的是筆跡資料 (顏色、粗細、比例座標)，而不是像素，所以檔案小、縮放不失真，而且能重新載入並同步給所有人。載入時長筆跡會切成每段 ≤500 點送出 (段與段共用接點)；選「先清除再載入」時，客戶端會等伺服器廣播的 `clear` 回來後才開始送，避免剛載入的筆跡被清掉。
-11. **房間號**：把 IPv4 依所屬私有網段去掉固定的前綴 (192.168.x.x 只剩 16 位元)，再用 Base32 編碼並加上種類字母，所以常見網路只要 5 碼。加入時解碼出 IP 直接以 TCP 連線並送 `ping` 確認，失敗會區分「沒開伺服器」「防火牆 / 不同網路」「不是白板」。
-12. **自動探索** (`start.py auto`)：依序嘗試 ① 本機 ② UDP 廣播 (`COLLAB_WHITEBOARD_DISCOVER` → UDP 9101，伺服器回傳人數與房間) ③ 平行 TCP 掃描同一個 /24 網段並送 `ping` 確認對方真的是白板伺服器 (廣播被擋時的備案)。找到多台時選人最多的、再比 IP，讓每台電腦選到同一台。都找不到時先隨機等一下再找一次，降低兩台同時啟動各開一個伺服器的機率。
-13. **權限與防呆**：只能接續 / 復原自己的筆跡；伺服器檢查顏色格式、粗細範圍、座標範圍，壞掉的 JSON 直接忽略，不會讓伺服器崩潰。每房間最多保存 5000 筆。
+11. **線上傳輸 (WebSocket)**：雲端平台只轉發 HTTP / WebSocket，所以 `transport.py` 用標準函式庫實作了 WebSocket (RFC 6455) 的握手、frame 編解碼 (含遮罩、分段、ping/pong、長度欄位)。伺服器看連線的第一行自動判斷：一行 JSON → 原本的 TCP 協定；HTTP `Upgrade: websocket` → WebSocket；一般 HTTP → 狀態頁 (給雲端平台的健康檢查)。同一個房間可以同時有 TCP 與 WebSocket 的使用者。
+12. **線上房間與復原**：`create_room` 用 `secrets` 產生 5 碼隨機房間號；`room_info` 讓加入的人先確認房間存在 (打錯不會跑進空房間)。線上模式 (`--public`) 不公開房間清單。伺服器重啟後房間是空的，第一個重連的客戶端送出 `restore` (保留原本的物件 id 與作者)，伺服器廣播 `reset` 給所有人；之後的 `restore` 會被忽略，所以不會重複。
+13. **房間號 (區網)**：把 IPv4 依所屬私有網段去掉固定的前綴 (192.168.x.x 只剩 16 位元)，再用 Base32 編碼並加上種類字母，所以常見網路只要 5 碼。加入時解碼出 IP 直接以 TCP 連線並送 `ping` 確認，失敗會區分「沒開伺服器」「防火牆 / 不同網路」「不是白板」。
+14. **自動探索** (`start.py auto`)：依序嘗試 ① 本機 ② UDP 廣播 (`COLLAB_WHITEBOARD_DISCOVER` → UDP 9101，伺服器回傳人數與房間) ③ 平行 TCP 掃描同一個 /24 網段並送 `ping` 確認對方真的是白板伺服器 (廣播被擋時的備案)。找到多台時選人最多的、再比 IP，讓每台電腦選到同一台。都找不到時先隨機等一下再找一次，降低兩台同時啟動各開一個伺服器的機率。
+15. **權限與防呆**：只能接續 / 復原自己的筆跡；伺服器檢查顏色格式、粗細範圍、座標範圍，壞掉的 JSON 直接忽略，不會讓伺服器崩潰。每房間最多保存 5000 筆。
 
 ## 測試
 
@@ -167,16 +207,20 @@ TCP 之上自訂應用層協定：每則訊息是一行 UTF-8 JSON，以 `\n` �
 | `client.py` | tkinter GUI 客戶端 |
 | `protocol.py` | 共用協定與編解碼 |
 | `start.py` | 啟動器：建立房間 / 輸入房間號加入 / 自動尋找 |
-| `roomcode.py` | 房間號 ⇄ IP 編碼 |
+| `roomcode.py` | 房間號 ⇄ IP 編碼 (區網) |
+| `transport.py` | 傳輸層：TCP 與 WebSocket (標準函式庫實作) |
+| `render.yaml`、`requirements.txt` | Render 雲端部署設定 |
+| `config.json` | 線上伺服器網址 |
 | `bot.py` | 自動畫圖的 demo 機器人 |
 | `test_server.py` | 伺服器與協定測試 |
 | `test_client.py` | 客戶端邏輯測試 (假 tkinter，不需螢幕) |
 | `test_start.py` | 建立 / 加入房間與自動探索測試 |
 | `test_roomcode.py` | 房間號編碼測試 |
+| `test_online.py` | WebSocket、線上房間、伺服器重啟復原測試 |
 
 ## 可延伸方向
 
 - TLS 加密 (`ssl` 模組包裝 socket)
 - 形狀工具 (矩形、圓形、箭頭)、改變已選物件的顏色、側邊聊天室
 - 筆跡存入 SQLite，伺服器重啟後畫布仍在
-- 用 WebSocket 做網頁版客戶端
+- 伺服器已支援 WebSocket，可再做一個瀏覽器版客戶端 (手機也能畫)

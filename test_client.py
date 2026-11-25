@@ -63,6 +63,7 @@ class Tk(Widget):
         super().__init__(None)
         self.root, self.focused, self.clipboard = self, None, None
         self.widgets = []
+        self.scheduled = []
         self.tk = types.SimpleNamespace(call=lambda *a: "x11")
 
     on_mainloop = None                         # 測試用：mainloop 時要執行的動作
@@ -77,7 +78,21 @@ class Tk(Widget):
         return next(w for w in self.widgets if w.kw.get("text") == text)
     def geometry(self, g): pass
     def protocol(self, name, fn): pass
-    def after(self, ms, fn=None): return None
+    def after(self, ms, fn=None):
+        if fn:
+            self.scheduled.append(fn)
+
+    def pump(self, cond, timeout=10):
+        """測試用：執行 after() 排程的回呼，直到 cond() 成立。"""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            todo, self.scheduled = self.scheduled, []
+            for fn in todo:
+                fn()
+            if cond():
+                return
+            time.sleep(0.02)
+        raise AssertionError("等待逾時")
     def after_cancel(self, job): pass
     def focus_get(self): return self.focused
     def clipboard_clear(self): self.clipboard = ""
@@ -220,7 +235,8 @@ class Canvas(Widget):
 
 def install_fake_tk():
     tk = types.ModuleType("tkinter")
-    for name, val in dict(Tk=Tk, Canvas=Canvas, Text=Text, Menu=Menu, Frame=Widget, Button=Widget,
+    for name, val in dict(Tk=Tk, Canvas=Canvas, Text=Text, Menu=Menu, Frame=Widget,
+                          Radiobutton=Widget, Button=Widget,
                           Label=Widget, Scale=Widget, Spinbox=Widget, Entry=Widget,
                           IntVar=Var, StringVar=Var, TclError=TclError).items():
         setattr(tk, name, val)
@@ -264,9 +280,9 @@ def ev(x, y, shift=False):
 class Board:
     """一個連上伺服器的假視窗。"""
 
-    def __init__(self, name, room):
+    def __init__(self, name, room, server=None):
         self.root = fake_tk.Tk()
-        self.net = client.Net("127.0.0.1", PORT, name, room, client.queue.Queue())
+        self.net = client.Net(server or f"127.0.0.1:{PORT}", name, room, client.queue.Queue())
         self.app = client.App(self.root, self.net, self.net.inbox)
         self.c = self.app.canvas
         self.net.start()
@@ -620,6 +636,56 @@ class ClientTest(unittest.TestCase):
         self.b.wait(lambda: len(B.strokes) == 2)
 
 
+class RestartTest(unittest.TestCase):
+    """線上伺服器重啟 (雲端休眠 / 重新部署) 後，客戶端自動重連並把畫面復原。"""
+
+    PORT = 9195
+
+    def start(self):
+        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(self.PORT),
+                              "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", self.PORT), timeout=0.2).close()
+                return p
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("server not up")
+
+    def test_restore_after_restart(self):
+        server = f"ws://127.0.0.1:{self.PORT}"
+        p = self.start()
+        a, b = Board("amy", "ROOM1", server=server), Board("ben", "ROOM1", server=server)
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        a.drag([(100, 100), (200, 150)])
+        b.app.set_tool("text")
+        b.app.on_press(ev(300, 300)); b.app.editor["w"].type("還在嗎"); b.app.commit_editor()
+        a.wait(lambda: len(a.app.strokes) == 2)
+        b.wait(lambda: len(b.app.strokes) == 2)
+        before = {sid: (o.get("owner"), o.get("text")) for sid, o in a.app.strokes.items()}
+
+        p.terminate(); p.wait()                                # 伺服器掛掉
+        a.wait(lambda: not a.app.online)
+        self.assertEqual(len(a.app.strokes), 2)               # 離線時畫面還在
+        p = self.start()                                       # 重新啟動 (房間全部清空)
+        self.addCleanup(lambda: (p.terminate(), p.wait()))
+        for x in (a, b):                                       # 兩邊都自動重連
+            x.wait(lambda x=x: x.app.online, timeout=10)
+        time.sleep(0.5)
+        for x in (a, b):
+            x.pump()
+        for x in (a, b):                                       # 畫面復原、沒有重複
+            x.wait(lambda x=x: {sid: (o.get("owner"), o.get("text"))
+                                for sid, o in x.app.strokes.items()} == before)
+        c = Board("cat", "ROOM1", server=server)               # 新加入的人也看得到
+        self.addCleanup(c.close)
+        c.wait(lambda: len(c.app.strokes) == 2)
+        b.app.undo()                                           # 作者資訊保留 -> 可復原自己的
+        a.wait(lambda: len(a.app.strokes) == 1)
+        self.assertNotIn("還在嗎", [o.get("text") for o in a.app.strokes.values()])
+
+
 class LauncherTest(unittest.TestCase):
     """start.py 不帶參數時的小視窗：建立房間 / 輸入房間號加入。"""
 
@@ -652,22 +718,77 @@ class LauncherTest(unittest.TestCase):
             code_var = self.entries(root)[1].kw["textvariable"]
             status = next(w for w in root.widgets if w.kw.get("wraplength"))
             join = root.button("加入房間").kw["command"]
+            settled = lambda: not status.kw["text"].startswith("連線中") or root.destroyed  # noqa
             join()
             seen["empty"] = status.kw["text"]
-            code_var.set("A0?11")
-            join()
-            seen["bad"] = status.kw["text"]
-            code_var.set(client.roomcode.encode("127.0.0.1", 9191))   # 沒有人開
-            join()
-            seen["down"] = status.kw["text"]
+            for key, code in [("bad", "A0?11"),
+                              ("down", client.roomcode.encode("127.0.0.1", 9191))]:  # 沒有人開
+                code_var.set(code)
+                join()
+                root.pump(settled)
+                seen[key] = status.kw["text"]
             code_var.set(client.roomcode.encode("127.0.0.1", 9189).lower())
             join()
+            root.pump(lambda: root.destroyed)
         r = self.run_launcher(act)
         self.assertEqual(seen["empty"], "請輸入房間號")
         self.assertIn("無效的字元", seen["bad"])
         self.assertIn("沒有開伺服器", seen["down"])
         self.assertEqual(r["action"], "join")
         self.assertEqual(r["target"][:3], ("127.0.0.1", 9189, "lobby"))
+
+    def test_online_mode(self):
+        """設定線上伺服器時：建立房間拿到隨機房間號、輸入房間號加入、打錯會提示。"""
+        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", "9192",
+                              "--public"], cwd=HERE, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (p.terminate(), p.wait()))
+        time.sleep(0.8)
+        import start
+        server = "ws://127.0.0.1:9192"
+
+        def create(root):
+            root.button("建立房間").kw["command"]()
+            root.pump(lambda: root.destroyed)
+        fake_tk.Tk.on_mainloop = create
+        try:
+            r = start.launcher_gui(server)
+        finally:
+            fake_tk.Tk.on_mainloop = None
+        self.assertEqual(r["action"], "online")
+        code = r["code"]
+        self.assertEqual(len(code), 5)
+        seen = {}
+
+        def join(root):
+            code_var = self.entries(root)[1].kw["textvariable"]
+            status = next(w for w in root.widgets if w.kw.get("wraplength"))
+            btn = root.button("加入房間").kw["command"]
+            code_var.set("ZZZZZ" if code != "ZZZZZ" else "00000")
+            btn()
+            root.pump(lambda: not status.kw["text"].startswith("連線中"))
+            seen["missing"] = status.kw["text"]
+            code_var.set(code.lower())
+            btn()
+            root.pump(lambda: root.destroyed)
+        fake_tk.Tk.on_mainloop = join
+        try:
+            r = start.launcher_gui(server)
+        finally:
+            fake_tk.Tk.on_mainloop = None
+        self.assertIn("找不到房間", seen["missing"])
+        self.assertEqual(r, {"action": "online", "code": code, "name": r["name"]})
+
+        # 兩個客戶端用 WebSocket 連進同一個房間協作
+        a = Board("amy", code, server=server)
+        b = Board("ben", code, server=server)
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual(a.app.code, code)                     # 視窗上顯示線上房間號
+        a.drag([(100, 100), (300, 200)])
+        b.wait(lambda: len(b.app.strokes) == 1)
+        a.app.set_tool("text")
+        a.app.on_press(ev(400, 300)); a.app.editor["w"].type("線上你好"); a.app.commit_editor()
+        b.wait(lambda: any(o.get("text") == "線上你好" for o in b.app.strokes.values()))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 """白板啟動器：建立房間 / 輸入房間號加入。
 
     python3 start.py                     # 跳出小視窗：建立房間，或輸入房間號加入
+    (設定了線上伺服器時 (config.json / --server / 環境變數 WHITEBOARD_SERVER)，
+     預設走線上：不同網路、不同地方的人都能加入；加 --lan 則改用區網)
     python3 start.py create              # 建立房間 (在本機開伺服器)，顯示房間號
     python3 start.py join A008Q          # 輸入房間號加入
     python3 start.py join A008Q --check  # 只檢查連不連得到 (連不到會說明原因)
@@ -21,7 +23,9 @@ import argparse
 import getpass
 import ipaddress
 import json
+import os
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -30,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import roomcode
+import transport
 from protocol import APP_ID, DEFAULT_PORT, DISCOVER_MAGIC, DISCOVERY_PORT, encode, local_ip
 
 HERE = Path(__file__).resolve().parent
@@ -207,9 +212,8 @@ def wait_until_empty(proc, port):
     print("伺服器已關閉")
 
 
-def run_client(host, port, room, name=None, code=None):
-    cmd = [sys.executable, str(HERE / "client.py"), "--host", host, "--port", str(port),
-           "--room", room]
+def run_client(server, room, name=None, code=None):
+    cmd = [sys.executable, str(HERE / "client.py"), "--server", server, "--room", room]
     if name:
         cmd += ["--name", name]
     if code:
@@ -218,6 +222,64 @@ def run_client(host, port, room, name=None, code=None):
         subprocess.run(cmd, cwd=HERE)
     except KeyboardInterrupt:
         pass
+
+
+# ---------- 線上伺服器 ----------
+CONFIG = HERE / "config.json"
+ONLINE_CODE_LEN = 5
+
+
+def configured_server(cli=None):
+    """線上伺服器網址：--server > 環境變數 WHITEBOARD_SERVER > config.json。"""
+    if cli:
+        return cli
+    if os.environ.get("WHITEBOARD_SERVER"):
+        return os.environ["WHITEBOARD_SERVER"]
+    try:
+        return (json.loads(CONFIG.read_text(encoding="utf-8")).get("server") or "").strip() or None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def online_error(e):
+    msg = str(e) or e.__class__.__name__
+    if isinstance(e, socket.gaierror):
+        msg = "找不到伺服器網址 (網址打錯，或這台電腦沒有網路)"
+    elif isinstance(e, (socket.timeout, TimeoutError)):
+        msg = "連線逾時 (伺服器可能還在喚醒，請再試一次)"
+    return RuntimeError(f"連不上線上伺服器：{msg}")
+
+
+def normalize_online_code(code):
+    c = roomcode.normalize_core(re.sub(r"[\s-]+", "", str(code)))
+    if len(c) != ONLINE_CODE_LEN:
+        raise ValueError(f"房間號應該是 {ONLINE_CODE_LEN} 碼")
+    return c
+
+
+def online_create(server):
+    """請線上伺服器開一個新房間，回傳房間號。"""
+    try:
+        reply = transport.request(server, timeout=90, type="create_room")
+    except (OSError, ValueError) as e:
+        raise online_error(e)
+    if reply.get("type") != "room_created":
+        raise RuntimeError("伺服器版本太舊，不支援建立房間 (請重新部署最新版)")
+    return reply["code"]
+
+
+def online_join(server, code):
+    """確認線上房間存在，回傳整理過的房間號。房間號錯誤丟 ValueError，其他丟 RuntimeError。"""
+    code = normalize_online_code(code)
+    try:
+        reply = transport.request(server, timeout=90, type="room_info", room=code)
+    except (OSError, ValueError) as e:
+        raise online_error(e)
+    if reply.get("type") != "room_info":
+        raise RuntimeError("伺服器版本太舊，不支援房間號 (請重新部署最新版)")
+    if not reply.get("exists"):
+        raise RuntimeError(f"找不到房間 {code}，請確認房間號 (伺服器重啟過的話，請房主重新建立)")
+    return code
 
 
 # ---------- 建立 / 加入房間 ----------
@@ -257,18 +319,39 @@ def print_code(code, port, room):
     print()
 
 
-def cmd_create(name, room, port, udp_port):
+def cmd_create(name, room, port, udp_port, server=None):
+    if server:                                  # 線上
+        try:
+            print(f"連線到線上伺服器 {server} ... (伺服器休眠時第一次約需 1 分鐘)")
+            code = online_create(server)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        line = "=" * 44
+        print(f"\n{line}\n  房間已建立！ 房間號：  {code}\n"
+              f"  其他人執行  python3 start.py  並輸入房間號即可加入\n"
+              f"  (不同網路、不同地方都可以)\n{line}\n")
+        run_client(server, code, name, code)
+        return
     try:
         proc, code = create_room(port, udp_port, room)
     except RuntimeError as e:
         sys.exit(str(e))
     print_code(code, port, room)
-    run_client("127.0.0.1", port, room, name, code)
+    run_client(f"127.0.0.1:{port}", room, name, code)
     if proc:
         wait_until_empty(proc, port)
 
 
-def cmd_join(code, name, check=False):
+def cmd_join(code, name, check=False, server=None):
+    if server:                                  # 線上
+        try:
+            code = online_join(server, code)
+        except (ValueError, RuntimeError) as e:
+            sys.exit(str(e))
+        print(f"房間 {code} 存在 ({server})")
+        if not check:
+            run_client(server, code, name, code)
+        return
     try:
         ip, port, room, info = join_target(code)
     except (ValueError, RuntimeError) as e:
@@ -278,11 +361,15 @@ def cmd_join(code, name, check=False):
         print("注意：那台的伺服器是舊版，文字框、縮放等新功能不會同步。請那台 git pull 後重開。")
     print(f"房間 {norm} -> {ip}:{port}  線上 {info.get('users', '?')} 人")
     if not check:
-        run_client(ip, port, room, name, norm)
+        run_client(f"{ip}:{port}", room, name, norm)
 
 
-def launcher_gui():
-    """小視窗：建立房間，或輸入房間號加入。回傳使用者的選擇 (關閉視窗則為空)。"""
+def launcher_gui(server=None):
+    """小視窗：建立房間，或輸入房間號加入。回傳使用者的選擇 (關閉視窗則為空)。
+
+    server 有值時可選「線上」或「區網」；連線動作在背景執行緒進行，視窗不會卡住。
+    """
+    import threading
     import tkinter as tk
     root = tk.Tk()
     root.title("協作白板")
@@ -299,40 +386,98 @@ def launcher_gui():
         default_name = "guest"
     name_var = tk.StringVar(value=default_name)
     tk.Entry(f, textvariable=name_var, width=18).grid(row=1, column=1, columnspan=2, sticky="we")
-    status = tk.Label(f, text="", fg="#c62828", wraplength=300, justify="left")
+    mode_var = tk.StringVar(value="online" if server else "lan")
+    modes = tk.Frame(f)
+    modes.grid(row=2, column=0, columnspan=3, pady=(10, 0))
+    if server:
+        host = transport.parse_server(server)[1]
+        tk.Radiobutton(modes, text=f"線上 ({host})", variable=mode_var,
+                       value="online").pack(side=tk.LEFT)
+        tk.Radiobutton(modes, text="同一個區網", variable=mode_var, value="lan").pack(side=tk.LEFT)
+    else:
+        tk.Label(modes, text="模式：同一個區網 (尚未設定線上伺服器，見 README)",
+                 fg="#888").pack()
+    status = tk.Label(f, text="", fg="#c62828", wraplength=320, justify="left")
+    buttons = []
 
     def name():
         return name_var.get().strip() or "guest"
 
+    def busy(text):
+        status.config(text=text, fg="#555")
+        for b in buttons:
+            b.config(state=tk.DISABLED)
+
+    def run_bg(work, done):
+        """在背景執行 work()，完成後在主執行緒呼叫 done(結果, 例外)。"""
+        box = {}
+
+        def target():
+            try:
+                box["value"] = work()
+            except Exception as e:          # noqa: BLE001  交給 done 顯示
+                box["error"] = e
+        th = threading.Thread(target=target, daemon=True)
+        th.start()
+
+        def check():
+            if th.is_alive():
+                root.after(100, check)
+                return
+            for b in buttons:
+                b.config(state=tk.NORMAL)
+            done(box.get("value"), box.get("error"))
+        root.after(100, check)
+
+    def fail(e):
+        status.config(text=str(e), fg="#c62828")
+
     def on_create():
-        result.update(action="create", name=name())
-        root.destroy()
+        if mode_var.get() == "lan":
+            result.update(action="create", name=name())
+            root.destroy()
+            return
+        busy("建立房間中… (線上伺服器休眠時第一次約需 1 分鐘)")
+
+        def done(code, err):
+            if err:
+                return fail(err)
+            result.update(action="online", code=code, name=name())
+            root.destroy()
+        run_bg(lambda: online_create(server), done)
 
     def on_join(event=None):
         code = code_var.get().strip()
         if not code:
-            status.config(text="請輸入房間號")
+            status.config(text="請輸入房間號", fg="#c62828")
             return
-        status.config(text="連線中...", fg="#555")
-        root.update_idletasks()
-        try:
-            target = join_target(code)
-        except (ValueError, RuntimeError) as e:
-            status.config(text=str(e), fg="#c62828")
-            return
-        result.update(action="join", target=target, name=name())
-        root.destroy()
+        online = mode_var.get() == "online"
+        busy("連線中…" + (" (線上伺服器休眠時第一次約需 1 分鐘)" if online else ""))
 
-    tk.Button(f, text="建立房間", width=24, command=on_create).grid(
-        row=2, column=0, columnspan=3, pady=(14, 6))
-    tk.Label(f, text="──────  或  ──────", fg="#999").grid(row=3, column=0, columnspan=3)
-    tk.Label(f, text="房間號").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=(6, 0))
+        def done(value, err):
+            if err:
+                return fail(err)
+            if online:
+                result.update(action="online", code=value, name=name())
+            else:
+                result.update(action="join", target=value, name=name())
+            root.destroy()
+        run_bg((lambda: online_join(server, code)) if online else (lambda: join_target(code)),
+               done)
+
+    b = tk.Button(f, text="建立房間", width=24, command=on_create)
+    b.grid(row=3, column=0, columnspan=3, pady=(14, 6))
+    buttons.append(b)
+    tk.Label(f, text="──────  或  ──────", fg="#999").grid(row=4, column=0, columnspan=3)
+    tk.Label(f, text="房間號").grid(row=5, column=0, sticky="e", padx=(0, 6), pady=(6, 0))
     code_var = tk.StringVar()
     entry = tk.Entry(f, textvariable=code_var, width=12, font=("TkFixedFont", 14))
-    entry.grid(row=4, column=1, pady=(6, 0))
+    entry.grid(row=5, column=1, pady=(6, 0))
     entry.bind("<Return>", on_join)
-    tk.Button(f, text="加入房間", command=on_join).grid(row=4, column=2, padx=(6, 0), pady=(6, 0))
-    status.grid(row=5, column=0, columnspan=3, pady=(10, 0), sticky="w")
+    b = tk.Button(f, text="加入房間", command=on_join)
+    b.grid(row=5, column=2, padx=(6, 0), pady=(6, 0))
+    buttons.append(b)
+    status.grid(row=6, column=0, columnspan=3, pady=(10, 0), sticky="w")
     entry.focus_set()
     root.mainloop()
     return result
@@ -340,28 +485,38 @@ def launcher_gui():
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
-    if not argv:                                # 沒有參數：跳出啟動視窗
-        r = launcher_gui()
-        if r.get("action") == "create":
+    if not argv or argv[0] in ("--server", "--lan"):   # 啟動視窗
+        ap = argparse.ArgumentParser(prog="start.py")
+        ap.add_argument("--server", help="線上伺服器網址，例如 wss://xxx.onrender.com")
+        ap.add_argument("--lan", action="store_true", help="不使用線上伺服器")
+        a = ap.parse_args(argv)
+        server = None if a.lan else configured_server(a.server)
+        r = launcher_gui(server)
+        if r.get("action") == "online":
+            run_client(server, r["code"], r["name"], r["code"])
+        elif r.get("action") == "create":
             cmd_create(r["name"], roomcode.DEFAULT_ROOM, DEFAULT_PORT, DISCOVERY_PORT)
         elif r.get("action") == "join":
             ip, port, room, info = r["target"]
-            run_client(ip, port, room, r["name"], roomcode.encode(ip, port, room))
+            run_client(f"{ip}:{port}", room, r["name"], roomcode.encode(ip, port, room))
         return
     if argv[0] in ("create", "join"):
         ap = argparse.ArgumentParser(prog="start.py " + argv[0])
         ap.add_argument("--name", help="暱稱 (未指定會在視窗跳出詢問)")
+        ap.add_argument("--server", help="線上伺服器網址 (預設讀 config.json)")
+        ap.add_argument("--lan", action="store_true", help="不使用線上伺服器，改用區網")
         if argv[0] == "create":
             ap.add_argument("--room", default=roomcode.DEFAULT_ROOM, help="房間名 (預設 lobby)")
             ap.add_argument("--port", type=int, default=DEFAULT_PORT)
             ap.add_argument("--udp-port", type=int, default=DISCOVERY_PORT)
             a = ap.parse_args(argv[1:])
-            cmd_create(a.name, a.room, a.port, a.udp_port)
+            cmd_create(a.name, a.room, a.port, a.udp_port,
+                       None if a.lan else configured_server(a.server))
         else:
             ap.add_argument("code", help="房間號，例如 A008Q")
             ap.add_argument("--check", action="store_true", help="只檢查連不連得到，不開白板")
             a = ap.parse_args(argv[1:])
-            cmd_join(a.code, a.name, a.check)
+            cmd_join(a.code, a.name, a.check, None if a.lan else configured_server(a.server))
         return
     if argv[0] == "auto":
         argv = argv[1:]
@@ -439,7 +594,7 @@ def auto_main(argv):
         host = "127.0.0.1"
         print(f"伺服器已啟動！其他電腦執行 python3 start.py 會自動連到這台 ({local_ip()})")
 
-    run_client(host, args.port, args.room, args.name,
+    run_client(f"{host}:{args.port}", args.room, args.name,
                roomcode.encode(local_ip() if host == "127.0.0.1" else host, args.port, args.room))
     if server_proc:
         wait_until_empty(server_proc, args.port)

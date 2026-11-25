@@ -21,6 +21,7 @@ from tkinter import colorchooser, filedialog, messagebox, simpledialog
 from tkinter import font as tkfont
 
 import roomcode
+from transport import ConnectionClosed, is_online, open_connection, parse_server
 from protocol import (APP_ID, DEFAULT_PORT, MAX_FONT, MAX_TEXT, MIN_FONT, chunk_pts, clamp_move,
                       clamp_scale, decode, dump_board, encode, is_text, move_obj,
                       local_ip, objects_bbox, parse_board, scale_obj)
@@ -31,52 +32,57 @@ PALETTE = ["#000000", "#e53935", "#fb8c00", "#fdd835", "#43a047",
 FLUSH_MS = 30          # 筆跡批次送出間隔
 CURSOR_INTERVAL = 0.05  # 游標位置最多每 50ms 送一次
 RECONNECT_SEC = 2
+HEARTBEAT_MS = 25000    # 心跳間隔：讓雲端平台知道還有人在用，不會進入休眠
 
 
 # ====================== 網路執行緒 ======================
 class Net(threading.Thread):
-    def __init__(self, host, port, name, room, inbox):
+    """網路執行緒：連線 (TCP 或 WebSocket)、自動重連、把收到的訊息放進 queue。"""
+
+    def __init__(self, server, name, room, inbox):
         super().__init__(daemon=True)
-        self.host, self.port, self.name, self.room = host, port, name, room
+        self.server, self.name, self.room = server, name, room
+        self.online_mode = is_online(server)
+        _, self.host, self.port, _ = parse_server(server)
         self.inbox = inbox
-        self.sock = None
+        self.conn = None
         self.lock = threading.Lock()
         self.running = True
 
     def run(self):
+        first = True
         while self.running:
             try:
-                sock = socket.create_connection((self.host, self.port), timeout=5)
-                sock.settimeout(None)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # 線上伺服器休眠時，第一次連線要等它喚醒 (約 1 分鐘)
+                timeout = 90 if self.online_mode and first else 10
+                if self.online_mode and first:
+                    self.inbox.put({"type": "_status", "online": False, "waking": True})
+                conn = open_connection(self.server, timeout=timeout)
+                conn.settimeout(None)
                 with self.lock:
-                    self.sock = sock
+                    self.conn = conn
                 self.send(type="hello", name=self.name, room=self.room)
                 self.inbox.put({"type": "_status", "online": True})
-                for line in sock.makefile("rb"):
-                    try:
-                        self.inbox.put(decode(line))
-                    except ValueError:
-                        pass
-            except OSError:
-                pass
+                first = False
+                while True:
+                    self.inbox.put(conn.recv())
+            except (OSError, ConnectionClosed) as e:
+                if first:
+                    self.inbox.put({"type": "_status", "online": False, "error": str(e)})
             with self.lock:
-                s, self.sock = self.sock, None
-            if s:
-                try:
-                    s.close()
-                except OSError:
-                    pass
+                c, self.conn = self.conn, None
+            if c:
+                c.close()
             if self.running:
                 self.inbox.put({"type": "_status", "online": False})
                 time.sleep(RECONNECT_SEC)   # 自動重連
 
     def send(self, **obj):
         with self.lock:
-            if not self.sock:
+            if not self.conn:
                 return False
             try:
-                self.sock.sendall(encode(**obj))
+                self.conn.send(**obj)
                 return True
             except OSError:
                 return False
@@ -84,11 +90,8 @@ class Net(threading.Thread):
     def stop(self):
         self.running = False
         with self.lock:
-            if self.sock:
-                try:
-                    self.sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+            if self.conn:
+                self.conn.shutdown()
 
 
 def user_color(name):
@@ -130,7 +133,9 @@ def room_code_for(host, port, room):
 class App:
     def __init__(self, root, net, inbox, code=None):
         self.root, self.net, self.inbox = root, net, inbox
-        self.code = code or room_code_for(net.host, net.port, net.room)
+        self.code = code or (net.room if net.online_mode
+                             else room_code_for(net.host, net.port, net.room))
+        self.welcomed = False      # 收過 welcome 了嗎 (用來判斷是否為「重新」連線)
         self.my_name = net.name
         self.online = False
         self.users = []
@@ -156,6 +161,7 @@ class App:
         self.build_ui()
         self.root.after(15, self.poll)
         self.root.after(FLUSH_MS, self.flush_timer)
+        self.root.after(HEARTBEAT_MS, self.heartbeat)
 
     # ====================== 介面 ======================
     def build_ui(self):
@@ -840,6 +846,10 @@ class App:
         self.last_sent = self.pending[-1]
         self.pending = []
 
+    def heartbeat(self):
+        self.net.send(type="heartbeat")
+        self.root.after(HEARTBEAT_MS, self.heartbeat)
+
     def flush_timer(self):
         self.flush()
         self.root.after(FLUSH_MS, self.flush_timer)
@@ -948,6 +958,17 @@ class App:
                 pass
         self.root.after(15, self.poll)
 
+    def apply_state(self, strokes):
+        """用一份完整狀態取代畫布 (welcome / reset)。"""
+        if self.editor and self.editor["sid"]:
+            self.commit_editor(cancel=True)
+        if self.drag and self.drag["mode"] == "band":
+            self.canvas.delete(self.drag["item"])
+        self.cur_sid, self.pending, self.pending_load, self.drag = None, [], None, None
+        self.strokes = strokes
+        self.selection = set()
+        self.redraw_all()
+
     def object_gone(self, sid):
         """物件被別人刪除 / 清除時，同步清掉本機的選取與編輯狀態。"""
         self.selection.discard(sid)
@@ -960,6 +981,14 @@ class App:
         t = m.get("type")
         if t == "_status":
             self.online = m["online"]
+            if m.get("waking"):
+                self.status.config(text="● 連線到線上伺服器中… (伺服器休眠時第一次約需 1 分鐘)",
+                                   fg="#ef6c00")
+                return
+            if m.get("error"):
+                self.status.config(text=f"● 連不上伺服器：{m['error'][:60]} (重試中...)",
+                                   fg="#c62828")
+                return
             if not self.online:
                 self.users = []
                 for n in list(self.cursors):
@@ -968,15 +997,21 @@ class App:
         elif t == "welcome":              # (重新)連線 -> 以伺服器的完整狀態為準
             self.my_name = m["name"]
             self.users = m["users"]
-            if self.editor and self.editor["sid"]:
-                self.commit_editor(cancel=True)
-            if self.drag and self.drag["mode"] == "band":
-                self.canvas.delete(self.drag["item"])
-            self.cur_sid, self.pending, self.pending_load, self.drag = None, [], None, None
-            self.strokes = {s["sid"]: s for s in m["strokes"]}
-            self.selection = set()
-            self.redraw_all()
+            local = dict(self.strokes)
+            if self.welcomed and not m["strokes"] and local:
+                # 重新連線時房間是空的 = 伺服器重啟過 (例如雲端休眠 / 更新)：
+                # 把自己手上的畫面傳回去復原；如果別人先復原了，伺服器會忽略並送 reset 來
+                self.net.send(type="restore",
+                              strokes=[dict(o, sid=sid) for sid, o in local.items()])
+                self.apply_state(local)
+                self.flash("伺服器重新啟動過，正在復原畫面...")
+            else:
+                self.apply_state({s["sid"]: s for s in m["strokes"]})
+            self.welcomed = True
             self.refresh_status()
+        elif t == "reset":                # 有人復原了整個畫面
+            self.apply_state({s["sid"]: s for s in m["strokes"]})
+            self.flash(f"畫面已由 {m.get('by', '?')} 復原")
         elif t == "draw":
             s = self.strokes.setdefault(m["sid"], {"color": m["color"], "width": m["width"],
                                                    "pts": [], "owner": m["owner"]})
@@ -1054,7 +1089,8 @@ class App:
 
 def main():
     ap = argparse.ArgumentParser(description="協作白板客戶端")
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--server", help="伺服器網址，例如 wss://xxx.onrender.com (線上) 或 host:port")
+    ap.add_argument("--host", default="127.0.0.1", help="區網伺服器 IP (未指定 --server 時使用)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--name", help="暱稱 (未指定會詢問)")
     ap.add_argument("--room", default="lobby", help="房間名稱 (預設 lobby)")
@@ -1068,7 +1104,7 @@ def main():
         name = simpledialog.askstring("協作白板", "請輸入暱稱:", parent=root) or "guest"
         root.deiconify()
     inbox = queue.Queue()
-    net = Net(args.host, args.port, name, args.room, inbox)
+    net = Net(args.server or f"{args.host}:{args.port}", name, args.room, inbox)
     App(root, net, inbox, code=args.code)
     net.start()
     root.mainloop()
