@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """傳輸層與線上功能測試：WebSocket、HTTP 狀態頁、房間號、復原訊息。
 
-    python3 test_online.py
+    python3 tests/test_online.py
 """
 import os
 import socket
@@ -12,17 +12,20 @@ import time
 import unittest
 from pathlib import Path
 
-import transport
-from transport import OP_CONT, OP_PING, OP_TEXT, open_connection, ws_frame
+ROOT = Path(__file__).resolve().parent.parent          # 專案根目錄
+sys.path.insert(0, str(ROOT))
 
-HERE = Path(__file__).resolve().parent
+import transport  # noqa: E402
+from transport import OP_CONT, OP_PING, OP_TEXT, open_connection, ws_frame  # noqa: E402
+
+
 PORT = 9241
 
 
 def start_server(port, env_port=False):
-    args = [sys.executable, str(HERE / "server.py")] + ([] if env_port else ["--port", str(port)])
+    args = [sys.executable, str(ROOT / "server.py")] + ([] if env_port else ["--port", str(port)])
     env = dict(os.environ, PORT=str(port)) if env_port else None
-    p = subprocess.Popen(args, cwd=HERE, stderr=subprocess.DEVNULL, env=env)
+    p = subprocess.Popen(args, cwd=ROOT, stderr=subprocess.DEVNULL, env=env)
     for _ in range(50):
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()

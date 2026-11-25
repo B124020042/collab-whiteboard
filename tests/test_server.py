@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """伺服器測試：啟動伺服器，用多個 WebSocket 客戶端驗證同步邏輯、權限與防呆。
 
-    python3 test_server.py
+    python3 tests/test_server.py
 """
 import json
 import socket
@@ -11,10 +11,13 @@ import time
 import unittest
 from pathlib import Path
 
-from protocol import chunk_pts, clamp_move, dump_board, move_obj, objects_bbox, parse_board
-from transport import OP_TEXT, ConnectionClosed, open_connection, ws_frame
+ROOT = Path(__file__).resolve().parent.parent          # 專案根目錄
+sys.path.insert(0, str(ROOT))
 
-HERE = Path(__file__).resolve().parent
+from protocol import chunk_pts, clamp_move, dump_board, move_obj, objects_bbox, parse_board  # noqa: E402
+from transport import OP_TEXT, ConnectionClosed, open_connection, ws_frame  # noqa: E402
+
+
 PORT = 9177
 
 
@@ -67,8 +70,8 @@ class C:
 class WhiteboardTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(PORT)],
-                                 cwd=HERE, stderr=subprocess.DEVNULL)
+        cls.p = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--port", str(PORT)],
+                                 cwd=ROOT, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()
@@ -149,8 +152,8 @@ class WhiteboardTest(unittest.TestCase):
 
     def test_bot_stress(self):
         watcher = C("watcher", "botroom")
-        r = subprocess.run([sys.executable, str(HERE / "bot.py"), "botroom", "--server",
-                            f"ws://127.0.0.1:{PORT}", "--count", "3"], cwd=HERE, timeout=30)
+        r = subprocess.run([sys.executable, str(ROOT / "bot.py"), "botroom", "--server",
+                            f"ws://127.0.0.1:{PORT}", "--count", "3"], cwd=ROOT, timeout=30)
         self.assertEqual(r.returncode, 0)
         watcher.until("user_leave")
         self.assertEqual(len(C("v", "botroom").welcome["strokes"]), 3)

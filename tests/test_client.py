@@ -5,7 +5,7 @@
 文字框、選取 / 移動 / 縮放、複製 / 剪下 / 貼上 / 刪除、右鍵選單、存檔讀檔、伺服器重啟後
 的復原，以及 start.py 的啟動視窗 (建立房間 / 輸入房間號加入)。
 
-    python3 test_client.py
+    python3 tests/test_client.py
 """
 import json
 import socket
@@ -16,7 +16,8 @@ import types
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent          # 專案根目錄
+sys.path.insert(0, str(ROOT))
 PORT = 9188
 
 
@@ -268,7 +269,6 @@ def install_fake_tk():
 
 
 fake_tk = install_fake_tk()
-sys.path.insert(0, str(HERE))
 import client  # noqa: E402  (必須在安裝假 tkinter 之後才匯入)
 
 
@@ -313,8 +313,8 @@ class Board:
 class ClientTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(PORT)],
-                                 cwd=HERE, stderr=subprocess.DEVNULL)
+        cls.p = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--port", str(PORT)],
+                                 cwd=ROOT, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()
@@ -640,7 +640,7 @@ class RestartTest(unittest.TestCase):
     PORT = 9195
 
     def start(self):
-        p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(self.PORT)], cwd=HERE, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--port", str(self.PORT)], cwd=ROOT, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 socket.create_connection(("127.0.0.1", self.PORT), timeout=0.2).close()
@@ -691,8 +691,8 @@ class LauncherTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port",
-                                  str(cls.PORT)], cwd=HERE, stderr=subprocess.DEVNULL)
+        cls.p = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--port",
+                                  str(cls.PORT)], cwd=ROOT, stderr=subprocess.DEVNULL)
         time.sleep(0.8)
 
     @classmethod

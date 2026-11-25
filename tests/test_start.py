@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """start.py 建立 / 加入房間測試 (在本機開一個伺服器模擬線上伺服器，不需要螢幕)。
 
-    python3 test_start.py
+    python3 tests/test_start.py
 """
 import os
 import socket
@@ -11,23 +11,26 @@ import time
 import unittest
 from pathlib import Path
 
-import start
-import transport
+ROOT = Path(__file__).resolve().parent.parent          # 專案根目錄
+sys.path.insert(0, str(ROOT))
 
-HERE = Path(__file__).resolve().parent
+import start  # noqa: E402
+import transport  # noqa: E402
+
+
 PORT = 9251
 SERVER = f"ws://127.0.0.1:{PORT}"
 
 
 def run(*args, env=None):
-    return subprocess.run([sys.executable, "start.py", *args], cwd=HERE, capture_output=True,
+    return subprocess.run([sys.executable, "start.py", *args], cwd=ROOT, capture_output=True,
                           text=True, timeout=30, env=dict(os.environ, **(env or {})))
 
 
 class StartTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.p = subprocess.Popen([sys.executable, str(HERE / "server.py"), "--port", str(PORT)], cwd=HERE, stderr=subprocess.DEVNULL)
+        cls.p = subprocess.Popen([sys.executable, str(ROOT / "server.py"), "--port", str(PORT)], cwd=ROOT, stderr=subprocess.DEVNULL)
         for _ in range(50):
             try:
                 socket.create_connection(("127.0.0.1", PORT), timeout=0.2).close()

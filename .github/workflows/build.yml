@@ -36,11 +36,7 @@ jobs:
         run: python -m pip install pyinstaller certifi
       - name: 執行測試
         continue-on-error: true      # 雲端機器較慢，時間敏感的測試偶爾失敗也不擋住打包
-        run: |
-          python test_server.py
-          python test_start.py
-          python test_online.py
-          python test_client.py
+        run: python -m unittest discover -s tests -v
       - name: 打包
         run: python build.py
       - uses: actions/upload-artifact@v7

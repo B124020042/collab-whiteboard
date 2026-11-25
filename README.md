@@ -147,10 +147,11 @@ python3 server.py                              # 在本機開伺服器 (port 910
 python3 start.py --server ws://127.0.0.1:9100  # 連本機伺服器
 
 # 自動化測試 (不需要螢幕)
-python3 test_server.py     # 伺服器：同步、權限、防呆、存檔格式
-python3 test_client.py     # 客戶端與啟動視窗 (用假的 tkinter)、伺服器重啟復原
-python3 test_start.py      # 建立 / 加入房間
-python3 test_online.py     # WebSocket frame、HTTP 狀態頁、房間號
+python3 -m unittest discover -s tests       # 全部 43 個測試
+python3 tests/test_server.py   # 伺服器：同步、權限、防呆、存檔格式
+python3 tests/test_client.py   # 客戶端與啟動視窗 (用假的 tkinter)、伺服器重啟復原
+python3 tests/test_start.py    # 建立 / 加入房間
+python3 tests/test_online.py   # WebSocket frame、HTTP 狀態頁、房間號
 
 # 打包執行檔 (在要打包的系統上執行；GitHub Actions 會自動做)
 pip install pyinstaller certifi
@@ -170,7 +171,7 @@ python3 build.py           # 產生 release/CollabWhiteboard-Windows.exe 或 -ma
 | `bot.py` | 自動畫圖的 demo 機器人 |
 | `build.py`、`.github/workflows/build.yml` | 打包執行檔、自動發布到 Releases |
 | `render.yaml`、`requirements.txt` | Render 部署設定 |
-| `test_*.py` | 自動化測試 |
+| `tests/` | 自動化測試 |
 
 ## 可延伸方向
 
